@@ -25,7 +25,7 @@ WORKER_SCRIPT := scripts/worker.sh
         wait-for-installed wait-for-status cluster-start clean-all deploy-dpf kubeconfig deploy-nfd \
         install-hypershift install-helm deploy-dpu-services prepare-dpu-files upgrade-dpf \
         redeploy-dpu enable-ovn-injector deploy-argocd deploy-maintenance-operator configure-flannel \
-        deploy-core-operator-sources setup-nfs-server deploy-metallb deploy-lso deploy-odf prepare-nfs run-dpf-sanity \
+        deploy-core-operator-sources setup-nfs-server deploy-metallb deploy-lso prepare-nfs run-dpf-sanity \
         add-worker-nodes worker-status approve-worker-csrs wait-approve-csrs
 
 all: 
@@ -154,9 +154,6 @@ deploy-metallb:
 deploy-lso:
 	@$(CLUSTER_SCRIPT) deploy-lso
 
-deploy-odf:
-	@$(CLUSTER_SCRIPT) deploy-odf
-
 prepare-nfs:
 	@$(MANIFESTS_SCRIPT) prepare-nfs
 
@@ -237,7 +234,6 @@ help:
 	@echo "  deploy-nfd       - Deploy NFD operator directly from source"
 	@echo "  deploy-metallb   - Deploy MetalLB operator for LoadBalancer support (only if HYPERSHIFT_API_IP is set)"
 	@echo "  deploy-lso       - Deploy Local Storage Operator for block storage (multi-node only)"
-	@echo "  deploy-odf       - Deploy OpenShift Data Foundation for distributed storage (multi-node only)"
 	@echo "  prepare-nfs      - Prepare NFS manifests (internal or external NFS based on configuration)"
 	@echo "  upgrade-dpf       - Interactive DPF operator upgrade (user-friendly wrapper for prepare-dpf-manifests)"
 	@echo "  prepare-dpu-files - Prepare post-installation manifests with custom values"

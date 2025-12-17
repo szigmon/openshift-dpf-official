@@ -248,7 +248,7 @@ help:
 	@echo "  approve-worker-csrs - Approve pending CSRs for configured workers"
 	@echo "  wait-approve-csrs - Wait and auto-approve CSRs until all workers are registered"
 	@echo ""
-	@echo "Hypershift Management:
+	@echo "Hypershift Management:"
 	@echo "  install-hypershift - Install Hypershift binary and operator"
 	@echo "  create-hypershift-cluster - Create a new Hypershift hosted cluster"
 	@echo "  configure-hypershift-dpucluster - Configure DPF to use Hypershift hosted cluster"

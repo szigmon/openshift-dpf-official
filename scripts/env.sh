@@ -142,9 +142,23 @@ HOST_CLUSTER_API=${HOST_CLUSTER_API:-"api.$CLUSTER_NAME.$BASE_DOMAIN"}
 NFS_SERVER_NODE_IP=${NFS_SERVER_NODE_IP:-""}
 NFS_PATH=${NFS_PATH:-"/"}
 
-# Default to LVMS for both SNO and MNO deployments
-# See: https://docs.redhat.com/en/documentation/openshift_container_platform/4.15/html/storage/logical-volume-manager-storage
-ETCD_STORAGE_CLASS=${ETCD_STORAGE_CLASS:-"lvms-vg1"}
+# Storage Configuration
+# STORAGE_TYPE: lvm (default) or odf
+STORAGE_TYPE=${STORAGE_TYPE:-"lvm"}
+
+if [ "${STORAGE_TYPE}" == "odf" ] && [ "${VM_COUNT}" -lt 3 ]; then
+    echo "Warning: ODF requires at least 3 nodes. Falling back to LVM."
+    STORAGE_TYPE="lvm"
+fi
+
+if [ "${STORAGE_TYPE}" == "odf" ]; then
+    ETCD_STORAGE_CLASS=${ETCD_STORAGE_CLASS:-"ocs-storagecluster-ceph-rbd"}
+    CATALOG_SOURCE_NAME=${CATALOG_SOURCE_NAME:-"redhat-operators-v419"}
+else
+    ETCD_STORAGE_CLASS=${ETCD_STORAGE_CLASS:-"lvms-vg1"}
+    CATALOG_SOURCE_NAME=${CATALOG_SOURCE_NAME:-"redhat-operators"}
+fi
+
 NUM_VFS=${NUM_VFS:-"46"}
 
 # Feature Configuration
@@ -173,8 +187,7 @@ STATIC_NET_FILE=${STATIC_NET_FILE:-"./configuration_templates/static_net.yaml"}
 NODES_MTU=${NODES_MTU:-"1500"}
 PRIMARY_IFACE=${PRIMARY_IFACE:-enp1s0}
 
-# OLM Catalog Source Configuration
-CATALOG_SOURCE_NAME=${CATALOG_SOURCE_NAME:-"redhat-operators"}
+# OLM Catalog Source Configuration (set by STORAGE_TYPE above)
 
 # MetalLB Configuration (for multi-node clusters)
 # HYPERSHIFT_API_IP: IP address for Hypershift API server LoadBalancer (required for multi-node with Hypershift)

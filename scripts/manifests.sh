@@ -135,7 +135,7 @@ function prepare_cluster_manifests() {
         "99-worker-bridge.yaml"
     )
 
-    if [ "${USE_V419_WORKAROUND}" != "true" ]; then
+    if [ "${STORAGE_TYPE}" != "odf" ]; then
         excluded_files+=("4.19-cataloguesource.yaml")
     fi
     
@@ -205,6 +205,7 @@ update_worker_manifest() {
 function deploy_core_operator_sources() {
     log [INFO] "Deploying NFD and SR-IOV subscriptions..."
     log [INFO] "Using catalog source: ${CATALOG_SOURCE_NAME}"
+    log [INFO] "Storage type: ${STORAGE_TYPE}"
 
     mkdir -p "$GENERATED_DIR"
 
@@ -216,6 +217,16 @@ function deploy_core_operator_sources() {
             apply_manifest "$GENERATED_DIR/$(basename "$f")" true
         fi
     done
+
+    if [ "${STORAGE_TYPE}" == "odf" ]; then
+        log [INFO] "Deploying v4.19 catalog source for ODF"
+        local catalog_file="$MANIFESTS_DIR/cluster-installation/4.19-cataloguesource.yaml"
+        if [ -f "$catalog_file" ]; then
+            apply_manifest "$catalog_file" true
+        else
+            log [WARN] "v4.19 catalog source file not found: $catalog_file"
+        fi
+    fi
 
     log [INFO] "Core operator sources deployed."
 }
@@ -435,17 +446,21 @@ function generate_ovn_manifests() {
 }
 
 function enable_storage() {
-    log [INFO] "Enabling storage operator"
-    
+    log [INFO] "Enabling storage operator (STORAGE_TYPE=${STORAGE_TYPE})"
+
     # Check if cluster is already installed
     if check_cluster_installed; then
         log [INFO] "Skipping storage operator configuration as cluster is already installed"
         return 0
     fi
-    
-    # Update cluster with LVM operator via assisted installer OLM
-    log [INFO] "Enable LVM operator via assisted installer OLM"
-    aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lvm"}]'
+
+    if [ "${STORAGE_TYPE}" == "odf" ]; then
+        log [INFO] "Enable LSO operator via assisted installer OLM (ODF will be deployed post-install)"
+        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lso"}]'
+    else
+        log [INFO] "Enable LVM operator via assisted installer OLM"
+        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lvm"}]'
+    fi
 }
 
 # -----------------------------------------------------------------------------

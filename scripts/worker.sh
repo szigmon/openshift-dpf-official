@@ -98,6 +98,23 @@ approve_worker_csrs() {
     [[ $approved -gt 0 ]] && log "INFO" "Approved $approved CSR(s)" || true
 }
 
+is_worker_registered() {
+    # Check if worker node is registered in cluster
+    # Uses BMH name to look up actual hostname from BMH status
+    local bmh_name="$1"
+
+    # First try: check if node exists with BMH name directly
+    oc get node "$bmh_name" &>/dev/null && return 0
+
+    # Second try: get actual hostname from BMH status and check that
+    local actual_hostname
+    actual_hostname=$(oc get bmh -n openshift-machine-api "$bmh_name" \
+        -o jsonpath='{.status.hardware.hostname}' 2>/dev/null)
+    [[ -n "$actual_hostname" ]] && oc get node "$actual_hostname" &>/dev/null && return 0
+
+    return 1
+}
+
 wait_and_approve_csrs() {
     local timeout="${CSR_APPROVAL_TIMEOUT:-600}"
     local count="${WORKER_COUNT:-0}"
@@ -107,8 +124,8 @@ wait_and_approve_csrs() {
     local ready=0
     for i in $(seq 1 "$count"); do
         local name_var="WORKER_${i}_NAME"
-        local name="${!name_var}"
-        oc get node "$name" &>/dev/null && ((ready++)) || true
+        local bmh_name="${!name_var}"
+        is_worker_registered "$bmh_name" && ((ready++)) || true
     done
     [[ "$ready" -ge "$count" ]] && { log "INFO" "All $count workers already registered, skipping CSR wait"; return 0; }
 
@@ -121,8 +138,8 @@ wait_and_approve_csrs() {
         local ready=0
         for i in $(seq 1 "$count"); do
             local name_var="WORKER_${i}_NAME"
-            local name="${!name_var}"
-            oc get node "$name" &>/dev/null && ((ready++)) || true
+            local bmh_name="${!name_var}"
+            is_worker_registered "$bmh_name" && ((ready++)) || true
         done
 
         [[ "$ready" -ge "$count" ]] && { log "INFO" "All $count workers registered"; return 0; }

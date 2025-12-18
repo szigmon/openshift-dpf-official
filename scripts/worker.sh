@@ -103,6 +103,15 @@ wait_and_approve_csrs() {
     local count="${WORKER_COUNT:-0}"
     local end=$((SECONDS + timeout))
 
+    # Check if all workers already registered (skip wait if so)
+    local ready=0
+    for i in $(seq 1 "$count"); do
+        local name_var="WORKER_${i}_NAME"
+        local name="${!name_var}"
+        oc get node "$name" &>/dev/null && ((ready++)) || true
+    done
+    [[ "$ready" -ge "$count" ]] && { log "INFO" "All $count workers already registered, skipping CSR wait"; return 0; }
+
     log "INFO" "Waiting for CSRs (timeout: ${timeout}s)..."
 
     while [[ $SECONDS -lt $end ]]; do
@@ -113,7 +122,7 @@ wait_and_approve_csrs() {
         for i in $(seq 1 "$count"); do
             local name_var="WORKER_${i}_NAME"
             local name="${!name_var}"
-            oc get node "$name" &>/dev/null && ((ready++))
+            oc get node "$name" &>/dev/null && ((ready++)) || true
         done
 
         [[ "$ready" -ge "$count" ]] && { log "INFO" "All $count workers registered"; return 0; }

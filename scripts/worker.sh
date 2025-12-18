@@ -91,7 +91,7 @@ approve_worker_csrs() {
     for csr in $(oc get csr -o go-template='{{range .items}}{{if not .status}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null); do
         if oc adm certificate approve "$csr" 2>/dev/null; then
             log "INFO" "Approved CSR $csr"
-            ((approved++))
+            ((approved++)) || true
         fi
     done
 

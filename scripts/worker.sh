@@ -99,18 +99,15 @@ approve_worker_csrs() {
 }
 
 is_worker_registered() {
-    # Check if worker node is registered in cluster
-    # Uses BMH name to look up actual hostname from BMH status
+    # Check if worker's BMH is in provisioned state
+    # This means the worker has been fully provisioned and should be a node
     local bmh_name="$1"
 
-    # First try: check if node exists with BMH name directly
-    oc get node "$bmh_name" &>/dev/null && return 0
-
-    # Second try: get actual hostname from BMH status and check that
-    local actual_hostname
-    actual_hostname=$(oc get bmh -n openshift-machine-api "$bmh_name" \
-        -o jsonpath='{.status.hardware.hostname}' 2>/dev/null)
-    [[ -n "$actual_hostname" ]] && oc get node "$actual_hostname" &>/dev/null && return 0
+    # Check BMH provisioning state - if "provisioned", the worker is done
+    local bmh_state
+    bmh_state=$(oc get bmh -n openshift-machine-api "$bmh_name" \
+        -o jsonpath='{.status.provisioning.state}' 2>/dev/null)
+    [[ "$bmh_state" == "provisioned" ]] && return 0
 
     return 1
 }

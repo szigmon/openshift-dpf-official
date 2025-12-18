@@ -95,7 +95,7 @@ approve_worker_csrs() {
         fi
     done
 
-    [[ $approved -gt 0 ]] && log "INFO" "Approved $approved CSR(s)"
+    [[ $approved -gt 0 ]] && log "INFO" "Approved $approved CSR(s)" || true
 }
 
 wait_and_approve_csrs() {

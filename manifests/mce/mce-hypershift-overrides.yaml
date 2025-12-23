@@ -1,0 +1,15 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: mce-overrides
+  namespace: multicluster-engine
+data:
+  overrides.json: |-
+    [
+      {
+        "image-name": "<HYPERSHIFT_IMAGE_NAME>",
+        "image-tag": "<HYPERSHIFT_IMAGE_TAG>",
+        "image-remote": "<HYPERSHIFT_IMAGE_REMOTE>",
+        "image-key": "hypershift_operator"
+      }
+    ]

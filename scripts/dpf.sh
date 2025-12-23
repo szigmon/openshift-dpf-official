@@ -160,22 +160,93 @@ function deploy_cert_manager() {
     fi
 }
 
+function deploy_mce() {
+    log [INFO] "Deploying MultiCluster Engine (MCE) for Hypershift support..."
+    mkdir -p "$GENERATED_DIR"
+
+    # Deploy MCE operator if not already installed (check both possible namespaces)
+    if ! oc get subscription multicluster-engine -n multicluster-engine &>/dev/null && \
+       ! oc get subscription multicluster-engine -n openshift-operators &>/dev/null; then
+        log [INFO] "Installing MCE operator..."
+        apply_manifest "${MANIFESTS_DIR}/mce/mce-namespace.yaml" true
+        apply_manifest "${MANIFESTS_DIR}/mce/mce-operatorgroup.yaml" true
+        process_template \
+            "${MANIFESTS_DIR}/mce/mce-subscription.yaml" \
+            "${GENERATED_DIR}/mce-subscription.yaml" \
+            "<MCE_CHANNEL>" "${MCE_CHANNEL}"
+        apply_manifest "${GENERATED_DIR}/mce-subscription.yaml" true
+    else
+        log [INFO] "MCE operator subscription already exists (installed via aicli). Skipping installation."
+    fi
+
+    # Wait for MCE operator CSV (check both possible namespaces)
+    log [INFO] "Waiting for MCE operator CSV..."
+    retry 60 10 bash -c "oc get csv -n multicluster-engine -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Succeeded || \
+                         oc get csv -n openshift-operators -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Succeeded" || {
+        log [ERROR] "MCE operator CSV did not reach Succeeded"; return 1
+    }
+
+    # Get existing MCE CR name (aicli may create one with different name like 'mce')
+    local mce_name
+    mce_name=$(oc get multiclusterengine -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+    # Create MCE CR if none exists
+    if [ -z "$mce_name" ]; then
+        log [INFO] "Creating MultiClusterEngine CR..."
+        apply_manifest "${MANIFESTS_DIR}/mce/mce-cr.yaml" true
+        mce_name="multiclusterengine"
+    else
+        log [INFO] "MCE CR '$mce_name' already exists (created by aicli). Skipping creation."
+    fi
+
+    # Wait for MCE to be available
+    log [INFO] "Waiting for MCE to be available..."
+    retry 60 10 bash -c "oc get multiclusterengine ${mce_name} -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Available" || \
+        log [WARN] "MCE not yet Available, continuing..."
+
+    # Enable hypershift component
+    log [INFO] "Enabling Hypershift component on MCE '$mce_name'..."
+    oc patch mce "${mce_name}" --type=merge -p '{"spec":{"overrides":{"components":[{"name":"hypershift","enabled":true}]}}}'
+
+    # Apply hypershift image override (parse HYPERSHIFT_IMAGE: registry/org/name:tag)
+    local img_tag="${HYPERSHIFT_IMAGE##*:}"
+    local img_no_tag="${HYPERSHIFT_IMAGE%:*}"
+    local img_name="${img_no_tag##*/}"
+    local img_remote="${img_no_tag%/*}"
+    log [INFO] "Setting Hypershift image: ${img_remote}/${img_name}:${img_tag}"
+    process_template \
+        "${MANIFESTS_DIR}/mce/mce-hypershift-overrides.yaml" \
+        "${GENERATED_DIR}/mce-hypershift-overrides.yaml" \
+        "<HYPERSHIFT_IMAGE_REMOTE>" "${img_remote}" \
+        "<HYPERSHIFT_IMAGE_NAME>" "${img_name}" \
+        "<HYPERSHIFT_IMAGE_TAG>" "${img_tag}"
+    apply_manifest "${GENERATED_DIR}/mce-hypershift-overrides.yaml" true
+    oc annotate mce "${mce_name}" installer.multicluster.openshift.io/image-overrides-configmap=mce-overrides --overwrite
+
+    # Wait for hypershift operator
+    log [INFO] "Waiting for Hypershift operator pods..."
+    wait_for_pods "hypershift" "app=operator" 60 10
+    log [INFO] "MCE deployment complete!"
+}
+
 function deploy_hosted_cluster() {
     deploy_hypershift
 }
 
 function deploy_hypershift() {
     if [ "${ENABLE_HCP_MULTUS}" = "true" ]; then
-        log [INFO] "HCP Multus enabled mode is active. Using custom hypershift image: ${HYPERSHIFT_IMAGE}"
+        log [INFO] "Using custom hypershift image: ${HYPERSHIFT_IMAGE}"
     fi
-    
-    # Check if Hypershift operator is already installed
-    if oc get deployment -n hypershift hypershift-operator &>/dev/null; then
-        log [INFO] "Hypershift operator already installed. Skipping deployment."
+
+    # Deploy MCE and enable Hypershift via MCE (check for hypershift namespace as indicator)
+    if oc get pods -n hypershift -l app=operator --no-headers 2>/dev/null | grep -q Running; then
+        log [INFO] "Hypershift operator already running. Skipping MCE deployment."
     else
-        log [INFO] "Installing latest hypershift operator"
-        install_hypershift
+        deploy_mce
     fi
+
+    # Install hypershift CLI binary (needed for hosted cluster creation)
+    install_hypershift_cli
 
     # Deploy MetalLB if HYPERSHIFT_API_IP is configured (multi-node clusters only)
     if [ -n "${HYPERSHIFT_API_IP}" ]; then
@@ -548,6 +619,9 @@ function main() {
             deploy-maintenance-operator)
                 deploy_maintenance_operator
                 ;;
+            deploy-mce)
+                deploy_mce
+                ;;
             apply-dpf)
                 apply_dpf
                 ;;
@@ -562,7 +636,7 @@ function main() {
                 ;;
             *)
                 log [INFO] "Unknown command: $command"
-                log [INFO] "Available commands: deploy-nfd, deploy-metallb, deploy-argocd, deploy-maintenance-operator, apply-dpf, deploy-hypershift"
+                log [INFO] "Available commands: deploy-nfd, deploy-metallb, deploy-argocd, deploy-maintenance-operator, deploy-mce, apply-dpf, deploy-hypershift"
                 exit 1
                 ;;
         esac

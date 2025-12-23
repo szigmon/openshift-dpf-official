@@ -30,8 +30,14 @@ function install_helm() {
     log "INFO" "Helm installation complete. Installed version: $(helm version --short)"
 }
 
-function install_hypershift() {
-    log "INFO" "Installing Hypershift binary and operator..."
+function install_hypershift_cli() {
+    log "INFO" "Installing Hypershift CLI binary..."
+
+    # Check if hypershift CLI is already installed
+    if command -v hypershift &> /dev/null; then
+        log "INFO" "Hypershift CLI already installed. Version: $(hypershift version 2>/dev/null || echo 'unknown')"
+        return 0
+    fi
 
     # Create a temporary container and copy the hypershift binary
     CONTAINER_COMMAND=${CONTAINER_COMMAND:-podman}
@@ -42,14 +48,12 @@ function install_hypershift() {
     sudo install -m 0755 -o root -g root /tmp/hypershift /usr/local/bin/hypershift
     rm -f /tmp/hypershift
 
-    # Install the Hypershift operator
-    KUBECONFIG=$KUBECONFIG hypershift install --hypershift-image $HYPERSHIFT_IMAGE
+    log "INFO" "Hypershift CLI installed successfully!"
+}
 
-    # Check the Hypershift operator status
-    log "INFO" "Checking Hypershift operator status..."
-    KUBECONFIG=$KUBECONFIG oc -n hypershift get pods
-
-    log "INFO" "Hypershift installation completed successfully!"
+# Legacy function for backwards compatibility
+function install_hypershift() {
+    install_hypershift_cli
 }
 
 function install_oc() {

@@ -24,7 +24,7 @@ WORKER_SCRIPT := scripts/worker.sh
         download-iso fix-yaml-spacing create-vms delete-vms enable-storage cluster-install wait-for-ready \
         wait-for-installed wait-for-status cluster-start clean-all deploy-dpf kubeconfig deploy-nfd \
         install-hypershift install-helm deploy-dpu-services prepare-dpu-files upgrade-dpf create-day2-cluster get-day2-iso \
-        redeploy-dpu enable-ovn-injector deploy-argocd deploy-maintenance-operator configure-flannel \
+        redeploy-dpu enable-ovn-injector deploy-argocd deploy-maintenance-operator deploy-mce configure-flannel \
         deploy-core-operator-sources setup-nfs-server deploy-metallb deploy-lso deploy-odf deploy-lvms prepare-nfs run-dpf-sanity \
         add-worker-nodes worker-status approve-worker-csrs wait-approve-csrs
 
@@ -112,6 +112,9 @@ deploy-argocd: install-helm
 
 deploy-maintenance-operator: install-helm
 	@$(DPF_SCRIPT) deploy-maintenance-operator
+
+deploy-mce:
+	@$(DPF_SCRIPT) deploy-mce
 
 deploy-dpf: prepare-dpf-manifests
 	@$(DPF_SCRIPT) apply-dpf
@@ -238,6 +241,7 @@ help:
 	@echo "DPF Installation:"
 	@echo "  deploy-argocd     - Deploy GitOps operator"
 	@echo "  deploy-maintenance-operator - Deploy Maintenance Operator (standalone)"
+	@echo "  deploy-mce        - Deploy MultiCluster Engine (MCE) operator with Hypershift support"
 	@echo "  deploy-dpf        - Deploy DPF operator (automatically deploys prerequisites for v25.7+)"
 	@echo "  prepare-dpf-manifests - Prepare DPF installation manifests"
 	@echo "  update-etc-hosts - Update /etc/hosts with cluster entries"
@@ -295,6 +299,7 @@ help:
 	@echo "  DPF_VERSION      - DPF operator version (default: $(DPF_VERSION))"
 	@echo "  ETCD_STORAGE_CLASS - StorageClass for hosted cluster etcd (default: $(ETCD_STORAGE_CLASS))"
 	@echo "  BFB_STORAGE_CLASS - StorageClass for BFB PVC (default: $(BFB_STORAGE_CLASS))"
+	@echo "  MCE_CHANNEL      - MultiCluster Engine operator channel (default: $(MCE_CHANNEL))"
 	@echo ""
 	@echo "MetalLB Configuration:"
 	@echo "  HYPERSHIFT_API_IP     - IP address for Hypershift API server LoadBalancer"

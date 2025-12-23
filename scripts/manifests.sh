@@ -456,12 +456,14 @@ function enable_storage() {
         return 0
     fi
 
+    # Build operator list: storage + MCE
+    # MCE is always enabled for Hypershift support
     if [ "${STORAGE_TYPE}" == "odf" ]; then
-        log [INFO] "Enable LSO operator via assisted installer OLM (ODF will be deployed post-install)"
-        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lso"}]'
+        log [INFO] "Enable LSO + MCE operators via assisted installer OLM (ODF will be deployed post-install)"
+        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lso"}, {"name": "mce"}]'
     else
-        log [INFO] "Enable LVM operator via assisted installer OLM"
-        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lvm"}]'
+        log [INFO] "Enable LVM + MCE operators via assisted installer OLM"
+        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lvm"}, {"name": "mce"}]'
     fi
 }
 

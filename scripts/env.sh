@@ -172,6 +172,9 @@ GITOPS_OPERATOR_VERSION=${GITOPS_OPERATOR_VERSION:-"v1.16.3"}
 # Maintenance Operator Configuration
 MAINTENANCE_OPERATOR_VERSION=${MAINTENANCE_OPERATOR_VERSION:-"0.2.0"}
 
+# MultiCluster Engine (MCE) Configuration
+MCE_CHANNEL=${MCE_CHANNEL:-"stable-2.10"}
+
 # Hypershift Configuration
 ENABLE_HCP_MULTUS=${ENABLE_HCP_MULTUS:-"true"}
 HYPERSHIFT_IMAGE=${HYPERSHIFT_IMAGE:-"quay.io/hypershift/hypershift-operator:latest"}

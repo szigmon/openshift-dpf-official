@@ -288,12 +288,18 @@ prepare_dpf_manifests() {
     fi
     
     # Always use auto-provisioned NFS for BFB storage (works for both SNO and MNO)
-    # Remove storageClassName to enable direct binding to NFS PersistentVolume
-    sed -i '/storageClassName:/d' "$GENERATED_DIR/bfb-pvc.yaml"
+    # Set empty storageClassName to enable direct binding to NFS PersistentVolume
+    update_file_multi_replace \
+        "$GENERATED_DIR/bfb-pvc.yaml" \
+        "$GENERATED_DIR/bfb-pvc.yaml" \
+        "<STORAGE_CLASS_LINE>" ""
 
     # Update static DPU cluster template
-    sed -i "s|<KUBERNETES_VERSION>|$OPENSHIFT_VERSION|g" "$GENERATED_DIR/static-dpucluster-template.yaml"
-    sed -i "s|<HOSTED_CLUSTER_NAME>|$HOSTED_CLUSTER_NAME|g" "$GENERATED_DIR/static-dpucluster-template.yaml"
+    update_file_multi_replace \
+        "$GENERATED_DIR/static-dpucluster-template.yaml" \
+        "$GENERATED_DIR/static-dpucluster-template.yaml" \
+        "<KUBERNETES_VERSION>" "$OPENSHIFT_VERSION" \
+        "<HOSTED_CLUSTER_NAME>" "$HOSTED_CLUSTER_NAME"
 
     # Extract NGC API key and update secrets
     NGC_API_KEY=$(jq -r '.auths."nvcr.io".password // empty' "$DPF_PULL_SECRET" 2>/dev/null)

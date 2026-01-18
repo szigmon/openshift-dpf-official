@@ -162,6 +162,12 @@ deploy-lso:
 deploy-odf:
 	@$(CLUSTER_SCRIPT) deploy-odf
 
+deploy-lvms:
+	@echo "INFO: LVMS is configured during cluster installation when STORAGE_TYPE=lvm (default)"
+	@echo "INFO: LVMS operator is deployed via assisted installer OLM during cluster creation"
+	@echo "INFO: Use 'make enable-storage' during cluster setup to configure LVMS"
+	@echo "INFO: To manually deploy LVMS post-installation, set STORAGE_TYPE=lvm and run 'make cluster-install'"
+
 prepare-nfs:
 	@$(MANIFESTS_SCRIPT) prepare-nfs
 

@@ -134,8 +134,10 @@ function prepare_cluster_manifests() {
         "99-worker-bridge.yaml"
     )
 
-    # Always exclude v4.19-specific CatalogSource (no longer needed with LVMS)
-    excluded_files+=("4.19-cataloguesource.yaml")
+    # Only exclude v4.19 catalog source if the workaround is not enabled
+    if [ "${USE_V419_WORKAROUND}" != "true" ]; then
+        excluded_files+=("4.19-cataloguesource.yaml")
+    fi
 
     # Copy all manifests except excluded files using utility function
     copy_manifests_with_exclusions "$MANIFESTS_DIR/cluster-installation" "$GENERATED_DIR" "${excluded_files[@]}"

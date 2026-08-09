@@ -6,8 +6,6 @@ metadata:
 spec:
   flannel:
     disable: true
-  imagePullSecrets:
-    - dpf-pull-secret
   # Kamaji is permanently disabled - only Hypershift is supported
   kamajiClusterManager:
     disable: true

@@ -1,5 +1,3 @@
-imagePullSecrets:
-  - name: dpf-pull-secret
 kamaji:
   enabled: false
 kamaji-etcd:

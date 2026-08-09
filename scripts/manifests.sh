@@ -187,16 +187,6 @@ prepare_dpf_manifests() {
     local escaped_api_key=$(escape_sed_replacement "$NGC_API_KEY")
     sed -i "s|<PASSWORD>|$escaped_api_key|g" "$GENERATED_DIR/ngc-secrets.yaml"
 
-    # Update pull secret
-    # Encode pull secret (Linux/GNU base64)
-    PULL_SECRET=$(cat "$DPF_PULL_SECRET" | base64 -w 0)
-    if [ -z "$PULL_SECRET" ]; then
-        log "ERROR" "Failed to encode pull secret"
-        return 1
-    fi
-    local escaped_secret=$(escape_sed_replacement "$PULL_SECRET")
-    sed -i "s|<PULL_SECRET_BASE64>|$escaped_secret|g" "$GENERATED_DIR/dpf-pull-secret.yaml"
-
     prepare_nfs
     
     # Process dpfoperatorconfig.yaml - replace cluster-specific values

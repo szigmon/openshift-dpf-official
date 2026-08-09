@@ -18,8 +18,6 @@ spec:
           cniConfDir: /run/multus/cni/net.d/
           mtu: "1500"
           skipCNIConfigInstallation: false
-        imagePullSecrets:
-          - name: dpf-pull-secret
   resourceRequirements:
     cpu: 1
     memory: 1Gi

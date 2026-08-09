@@ -7,6 +7,4 @@ spec:
   deploymentServiceName: "doca-blueman-service"
   serviceConfiguration:
     helmChart:
-      values:
-        imagePullSecrets:
-        - name: dpf-pull-secret
+      values: {}

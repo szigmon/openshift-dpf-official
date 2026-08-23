@@ -120,40 +120,37 @@ function wait_for_pods() {
     local delay=$4
 
     for i in $(seq 1 "$max_attempts"); do
-        # Display pod status (allow this to fail without exiting)
-        oc get pods -n "$namespace" -l "$label" 2>&1 || true
-        
-        # Check if any pods exist with the label
+        # Display pod status (tolerate API timeouts during cluster finalizing)
+        oc get pods -n "$namespace" -l "$label" 2>/dev/null || true
+
         local pod_count
-        pod_count=$(oc get pods -n "$namespace" -l "$label" --no-headers 2>/dev/null | wc -l)
-        
+        pod_count=$(oc get pods -n "$namespace" -l "$label" --no-headers 2>/dev/null | wc -l || echo "0")
+        pod_count=$(echo "$pod_count" | tr -d '[:space:]')
+        [[ -z "$pod_count" ]] && pod_count=0
+
         if [[ "$pod_count" -eq 0 ]]; then
             log "INFO" "No pods found with label $label yet (attempt $i/$max_attempts)..."
             sleep "$delay"
             continue
         fi
-        
-        # Check if all pods are ready (all containers up and ready)
-        # Get Ready condition status for all pods and count "True" values
+
         local ready_pods
         ready_pods=$(oc get pods -n "$namespace" -l "$label" -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o "True" | wc -l || echo "0")
-        
-        # Ensure ready_pods is a valid number
         ready_pods=$(echo "$ready_pods" | tr -d '[:space:]')
         [[ -z "$ready_pods" ]] && ready_pods=0
-        
+
         if [[ "$ready_pods" -eq "$pod_count" ]]; then
             log "INFO" "All $pod_count $label pods are ready (all containers running)"
             return 0
         fi
-        
+
         log "INFO" "Waiting for $label pods to be ready: $ready_pods/$pod_count ready (attempt $i/$max_attempts)..."
         sleep "$delay"
     done
 
     log "ERROR" "$label pods failed to become ready after $max_attempts attempts"
-    oc get pods -n "$namespace" -l "$label"
-    oc describe pod -n "$namespace" -l "$label"
+    oc get pods -n "$namespace" -l "$label" || true
+    oc describe pod -n "$namespace" -l "$label" || true
     exit 1
 }
 
@@ -341,7 +338,12 @@ update_file_multi_replace() {
     while [ $i -lt ${#pairs[@]} ]; do
         local placeholder="${pairs[$i]}"
         local value="${pairs[$((i+1))]}"
-        log [INFO] "Replacing ${placeholder} with ${value} in ${target_file}"
+	# check for api keys or secrets e.g. NGC_API_KEY or PULL_SECRET_BASE64, and ensure we don't output their values in log files
+	if [[ "${placeholder^^}" == *API_KEY* || "${placeholder^^}" == *SECRET* ]]; then
+            log [INFO] "Replacing ${placeholder} with [REDACTED] in ${target_file}"
+        else
+            log [INFO] "Replacing ${placeholder} with ${value} in ${target_file}"
+        fi
 
         # Use bash parameter expansion for replacement (handles multi-line naturally)
         content="${content//${placeholder}/${value}}"
@@ -404,6 +406,24 @@ copy_manifests_with_exclusions() {
     return 0
 }
 
+# Compare two OpenShift version strings (major.minor only).
+# Returns 0 (true) if $1 >= $2, 1 (false) otherwise.
+# Usage: ocp_version_gte "4.22.1" "4.22" && echo "yes"
+ocp_version_gte() {
+    printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
+function ensure_ssh_key_in_home() {
+    if [ ! -f "${SSH_KEY}" ]; then
+        log "ERROR" "SSH public key file not found: ${SSH_KEY}. Set SSH_KEY in .env and place your .pub key there."
+        return 1
+    fi
+    if [[ "${SSH_KEY}" != *.pub ]]; then
+        log "ERROR" "SSH_KEY must point to a .pub file, got: ${SSH_KEY}"
+        return 1
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # Cleanup functions
 # -----------------------------------------------------------------------------
@@ -418,6 +438,60 @@ function clean_resources() {
     
     log "INFO" "Cleanup complete"
 }
+
+# -----------------------------------------------------------------------------
+# Remote libvirt helpers
+# -----------------------------------------------------------------------------
+libvirt_uri() {
+    if [ -n "${LIBVIRT_HOST:-}" ]; then
+        echo "qemu+ssh://${LIBVIRT_HOST}/system"
+    else
+        echo "qemu:///system"
+    fi
+}
+
+is_remote_libvirt() {
+    [ -n "${LIBVIRT_HOST:-}" ]
+}
+
+libvirt_host_cmd() {
+    if is_remote_libvirt; then
+        ssh "${LIBVIRT_HOST}" -- "$(printf '%q ' "$@")"
+    else
+        "$@"
+    fi
+}
+
+# Wraps virsh with the correct connection URI (local or remote).
+# Callers don't need to know about LIBVIRT_URI.
+lvirsh() {
+    virsh -c "${LIBVIRT_URI}" "$@"
+}
+
+# Wraps virt-install with the correct connection URI.
+lvirt_install() {
+    virt-install --connect "${LIBVIRT_URI}" "$@"
+}
+
+# Run a local script on the libvirt host. Passes env vars as prefix and
+# streams the script via stdin when remote, or executes it directly when local.
+# Usage: libvirt_host_script "VAR1=val1 VAR2=val2" /path/to/script.sh [args...]
+libvirt_host_script() {
+    local env_prefix="$1"; shift
+    local script="$1"; shift
+    if is_remote_libvirt; then
+        local escaped_args
+        escaped_args=$(printf '%q ' "$@")
+        ssh "${LIBVIRT_HOST}" "${env_prefix} bash -s -- ${escaped_args}" < "${script}"
+    else
+        env ${env_prefix} "${script}" "$@"
+    fi
+}
+
+# Note: LIBVIRT_URI is computed at source time. This relies on env.sh being
+# sourced first (which sets LIBVIRT_HOST). If any script sources utils.sh
+# before setting LIBVIRT_HOST, the URI will silently fall back to local.
+LIBVIRT_URI=$(libvirt_uri)
 
 generate_mac_from_machine_id() {
     local vm_name="$1"

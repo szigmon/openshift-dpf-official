@@ -1,8 +1,8 @@
-# Include environment variables
+# Include environment variables (skip for targets that don't need a .env)
+ifeq ($(filter generate-env validate-env-files help,$(MAKECMDGOALS)),)
 include .env
-
-# Export variables to child processes
 export
+endif
 
 # Script paths
 CLUSTER_SCRIPT := scripts/cluster.sh
@@ -12,36 +12,42 @@ DPF_SCRIPT := scripts/dpf.sh
 VM_SCRIPT := scripts/vm.sh
 UTILS_SCRIPT := scripts/utils.sh
 POST_INSTALL_SCRIPT := scripts/post-install.sh
-NFS_SERVICE_SCRIPT := scripts/nfs-service.sh
+VERIFY_SCRIPT := scripts/verify.sh
+ENV_SCRIPT := scripts/env.sh
 
 # Sanity tests script:
 SANITY_CHECKS_SCRIPT := scripts/dpf-sanity-checks.sh
 
+# Traffic flow tests script
+TFT_SCRIPT := scripts/traffic-flow-tests.sh
+
+# Worker provisioning script
+WORKER_SCRIPT := scripts/worker.sh
+
 .PHONY: all clean check-cluster create-cluster prepare-manifests generate-ovn update-paths help delete-cluster verify-files \
         download-iso fix-yaml-spacing create-vms delete-vms enable-storage cluster-install wait-for-ready \
-        wait-for-installed wait-for-status cluster-start clean-all deploy-dpf kubeconfig deploy-nfd \
+        wait-for-installed wait-for-status cluster-start clean-all deploy-dpf kubeconfig kubeadmin-password deploy-nfd \
         install-hypershift install-helm deploy-dpu-services prepare-dpu-files upgrade-dpf create-day2-cluster get-day2-iso \
+        download-day2-iso create-worker-vms delete-worker-vms add-vm-workers install-day2-hosts \
         redeploy-dpu enable-ovn-injector deploy-argocd deploy-maintenance-operator configure-flannel \
-        deploy-core-operator-sources setup-nfs-server deploy-metallb deploy-lso deploy-odf prepare-nfs run-dpf-sanity
+        deploy-core-operator-sources deploy-metallb deploy-lso deploy-odf deploy-lvms run-dpf-sanity \
+        add-worker-nodes worker-status approve-worker-csrs \
+        deploy-csr-approver delete-csr-approver \
+        delete-dpf-hcp-provisioner-operator \
+        verify-deployment verify-workers verify-dpu-nodes verify-dpudeployment \
+        run-traffic-flow-tests tft-setup tft-cleanup tft-show-config tft-results aicli-list \
+        validate-env-files generate-env deploy-observability
 
 all: 
 	@mkdir -p logs
 	@bash -o pipefail -c '$(MAKE) _all 2>&1 | tee "logs/make_all_$(shell date +%Y%m%d_%H%M%S).log"'
 
-_all: verify-files check-cluster create-vms prepare-manifests cluster-install update-etc-hosts kubeconfig deploy-dpf prepare-dpu-files deploy-dpu-services enable-ovn-injector
+_all: verify-files check-cluster create-vms prepare-manifests cluster-install update-etc-hosts kubeconfig add-worker-nodes deploy-dpf prepare-dpu-files deploy-dpu-services enable-ovn-injector deploy-observability
 	@echo ""
 	@echo "================================================================================"
 	@echo "✅ DPF Installation Complete!"
 	@echo "================================================================================"
-	@echo ""
-	@echo "Next steps to add worker nodes with DPUs:"
-	@echo "1. Access Assisted Installer UI and download discovery ISO"
-	@echo "2. Boot worker nodes with the discovery ISO"
-	@echo "3. Approve pending certificate signing requests"
-	@echo "4. Wait for nodes to join the cluster"
-	@echo "5. Monitor DPU deployment progress"
-	@echo ""
-	@echo "================================================================================"
+	@$(VERIFY_SCRIPT) verify-deployment
 
 verify-files:
 	@$(UTILS_SCRIPT) verify-files
@@ -49,6 +55,9 @@ verify-files:
 clean:
 	@$(CLUSTER_SCRIPT) clean
 
+aicli-list:
+	@bash -c 'source scripts/env.sh && aicli list clusters'
+	
 delete-cluster:
 	@$(CLUSTER_SCRIPT) delete-cluster
 
@@ -81,6 +90,43 @@ create-vms: download-iso
 
 delete-vms:
 	@$(VM_SCRIPT) delete
+
+
+download-day2-iso: create-day2-cluster
+	@$(CLUSTER_SCRIPT) download-day2-iso
+
+create-worker-vms: download-day2-iso
+	@$(VM_SCRIPT) create-worker-vms
+
+delete-worker-vms:
+	@$(VM_SCRIPT) delete-worker-vms
+
+add-vm-workers:
+	@if [ "$(VM_WORKER_COUNT)" = "0" ] || [ -z "$(VM_WORKER_COUNT)" ]; then \
+		echo "VM_WORKER_COUNT=0, skipping VM worker provisioning"; \
+	else \
+		$(MAKE) create-worker-vms; \
+		echo "================================================================================"; \
+		echo "Adding VM worker nodes via Assisted Installer day2 flow..."; \
+		echo "================================================================================"; \
+		$(CLUSTER_SCRIPT) install-day2-hosts; \
+		if [ "$(AUTO_APPROVE_WORKER_CSR)" = "true" ]; then \
+			echo ""; \
+			echo "AUTO_APPROVE_WORKER_CSR=true - Deploying CSR auto-approver CronJob..."; \
+			$(WORKER_SCRIPT) deploy-csr-auto-approver; \
+		else \
+			echo ""; \
+			$(WORKER_SCRIPT) display-manual-csr-instructions; \
+		fi; \
+		echo ""; \
+		echo "================================================================================"; \
+		echo "VM worker node provisioning complete!"; \
+		echo "Run 'make worker-status' to verify nodes joined the cluster."; \
+		echo "================================================================================"; \
+	fi
+
+install-day2-hosts:
+	@$(CLUSTER_SCRIPT) install-day2-hosts
 
 cluster-start:
 	@$(CLUSTER_SCRIPT) start-cluster-installation
@@ -118,10 +164,16 @@ deploy-dpf: prepare-dpf-manifests
 prepare-dpu-files:
 	@$(POST_INSTALL_SCRIPT) prepare
 
+generate-overrides:
+	@$(POST_INSTALL_SCRIPT) generate-overrides
+
 deploy-dpu-services: prepare-dpu-files
 	@$(POST_INSTALL_SCRIPT) apply
 
-deploy-hypershift:
+deploy-observability:
+	@$(POST_INSTALL_SCRIPT) observability
+
+deploy-hypershift: install-helm
 	@$(DPF_SCRIPT) deploy-hypershift
 
 create-ignition-template:
@@ -149,6 +201,9 @@ clean-all:
 kubeconfig:
 	@$(CLUSTER_SCRIPT) get-kubeconfig
 
+kubeadmin-password:
+	@$(CLUSTER_SCRIPT) get-kubeadmin-password
+
 deploy-nfd:
 	@$(DPF_SCRIPT) deploy-nfd
 
@@ -161,8 +216,8 @@ deploy-lso:
 deploy-odf:
 	@$(CLUSTER_SCRIPT) deploy-odf
 
-prepare-nfs:
-	@$(MANIFESTS_SCRIPT) prepare-nfs
+deploy-lvms:
+	@$(CLUSTER_SCRIPT) deploy-lvm
 
 install-hypershift:
 	@$(TOOLS_SCRIPT) install-hypershift
@@ -170,13 +225,89 @@ install-hypershift:
 install-helm:
 	@$(TOOLS_SCRIPT) install-helm
 
-setup-nfs-server:
-	@$(NFS_SERVICE_SCRIPT)
-
 run-dpf-sanity:
 	@echo "Running $(SANITY_CHECKS_SCRIPT) ..."
 	@chmod +x $(SANITY_CHECKS_SCRIPT)
 	@$(SANITY_CHECKS_SCRIPT)
+
+# Traffic Flow Tests
+run-traffic-flow-tests:
+	@echo "================================================================================"
+	@echo "Running Traffic Flow Tests..."
+	@echo "================================================================================"
+	@$(TFT_SCRIPT) run-full
+
+tft-setup:
+	@echo "Setting up Traffic Flow Tests environment..."
+	@$(TFT_SCRIPT) setup
+
+tft-cleanup:
+	@echo "Cleaning up Traffic Flow Tests..."
+	@$(TFT_SCRIPT) cleanup
+
+tft-show-config:
+	@$(TFT_SCRIPT) show-config
+
+tft-results:
+	@$(TFT_SCRIPT) show-results
+
+add-worker-nodes:
+	@echo "================================================================================"
+	@echo "Adding worker nodes via BMO/Redfish provisioning..."
+	@echo "================================================================================"
+	@mkdir -p $(GENERATED_DIR)/worker-provisioning
+	@$(WORKER_SCRIPT) provision-all-workers
+	@if [ "$(AUTO_APPROVE_WORKER_CSR)" = "true" ]; then \
+		echo ""; \
+		echo "AUTO_APPROVE_WORKER_CSR=true - Deploying CSR auto-approver CronJob..."; \
+		$(WORKER_SCRIPT) deploy-csr-auto-approver; \
+	else \
+		echo ""; \
+		$(WORKER_SCRIPT) display-manual-csr-instructions; \
+	fi
+	@echo ""
+	@echo "================================================================================"
+	@echo "Worker node provisioning initiated!"
+	@echo "Generated manifests: $(GENERATED_DIR)/worker-provisioning/"
+	@echo "Run 'make worker-status' to monitor progress."
+	@echo "================================================================================"
+
+worker-status:
+	@$(WORKER_SCRIPT) display-worker-status
+
+approve-worker-csrs:
+	@$(WORKER_SCRIPT) approve-worker-csrs
+
+deploy-csr-approver:
+	@echo "Deploying CSR auto-approver for host cluster workers..."
+	@$(WORKER_SCRIPT) deploy-csr-auto-approver
+
+delete-csr-approver:
+	@$(WORKER_SCRIPT) delete-csr-auto-approver
+
+delete-dpf-hcp-provisioner-operator:
+	@echo "Deleting DPF HCP Provisioner Operator..."
+	@$(DPF_SCRIPT) delete-dpf-hcp-provisioner-operator
+
+# Verification targets
+verify-deployment:
+	@$(VERIFY_SCRIPT) verify-deployment
+
+verify-workers:
+	@$(VERIFY_SCRIPT) verify-workers
+
+verify-dpu-nodes:
+	@$(VERIFY_SCRIPT) verify-dpu-nodes
+
+verify-dpudeployment:
+	@$(VERIFY_SCRIPT) verify-dpudeployment
+
+validate-env-files:
+	@$(ENV_SCRIPT) validate-env-files
+
+FORCE ?= false
+generate-env: validate-env-files
+	@$(ENV_SCRIPT) generate-env $(FORCE)
 
 help:
 	@echo "Available targets:"
@@ -195,6 +326,11 @@ help:
 	@echo "VM Management:"
 	@echo "  create-vms        - Create virtual machines for the cluster"
 	@echo "  delete-vms        - Delete virtual machines"
+	@echo "  add-vm-workers    - Add VM worker nodes via Assisted Installer day2 flow (full lifecycle)"
+	@echo "  create-worker-vms - Create worker VMs from day2 ISO (idempotent, skips existing VMs)"
+	@echo "  delete-worker-vms - Delete worker VMs"
+	@echo "  download-day2-iso - Download day2 ISO for worker VMs (depends on create-day2-cluster)"
+	@echo "  install-day2-hosts - Bind and start installation for discovered day2 hosts"
 	@echo ""
 	@echo "Installation and Status:"
 	@echo "  cluster-install   - Start cluster installation (includes waiting for ready and installed status)"
@@ -203,6 +339,7 @@ help:
 	@echo "  wait-for-ready    - Wait for cluster ready status"
 	@echo "  wait-for-installed - Wait for cluster installed status"
 	@echo "  kubeconfig       - Download cluster kubeconfig if not exists"
+	@echo "  kubeadmin-password - Download kubeadmin password for the cluster"
 	@echo ""
 	@echo "DPF Installation:"
 	@echo "  deploy-argocd     - Deploy GitOps operator"
@@ -211,16 +348,37 @@ help:
 	@echo "  prepare-dpf-manifests - Prepare DPF installation manifests"
 	@echo "  update-etc-hosts - Update /etc/hosts with cluster entries"
 	@echo "  deploy-nfd       - Deploy NFD operator directly from source"
-	@echo "  deploy-metallb   - Deploy MetalLB operator for LoadBalancer support (only if HYPERSHIFT_API_IP is set)"
-	@echo "  deploy-lso       - Deploy Local Storage Operator for block storage (multi-node only)"
-	@echo "  deploy-odf       - Deploy OpenShift Data Foundation for distributed storage (multi-node only)"
-	@echo "  prepare-nfs      - Prepare NFS manifests (internal or external NFS based on configuration)"
+	@echo "  deploy-metallb   - Deploy MetalLB operator for LoadBalancer support (only if HYPERSHIFT_API_IP is set; IPAddressPool/L2Advertisement managed by dpf-hcp-provisioner-operator)"
+	@echo "  deploy-lso       - Deploy Local Storage Operator for block storage (multi-node only; skipped if SKIP_DEPLOY_STORAGE=true)"
+	@echo "  deploy-lso       - Deploy Local Storage Operator for block storage (multi-node only; skipped if SKIP_DEPLOY_STORAGE=true)"
+	@echo "  deploy-lvms      - Deploy LVMS (Logical Volume Manager Storage) for etcd storage (default with STORAGE_TYPE=lvm)"
+	@echo "  deploy-odf       - Deploy OpenShift Data Foundation for distributed storage (multi-node only, requires STORAGE_TYPE=odf)"
+	@echo "  SKIP_DEPLOY_STORAGE=true - Use existing StorageClasses; set ETCD_STORAGE_CLASS to your StorageClass name"
 	@echo "  upgrade-dpf       - Interactive DPF operator upgrade (user-friendly wrapper for prepare-dpf-manifests)"
 	@echo "  prepare-dpu-files - Prepare post-installation manifests with custom values"
 	@echo "  deploy-dpu-services - Deploy DPU services to the cluster"
 	@echo "  configure-flannel - Deploy flannel IPAM controller for automatic podCIDR assignment"
+	@echo "  add-worker-nodes  - Provision worker nodes via BMO/Redfish (uses WORKER_* env vars)"
+	@echo "  worker-status     - Display provisioning status for all configured workers"
+	@echo "  approve-worker-csrs - Approve pending CSRs (one-time, for manual use)"
+	@echo "  deploy-csr-approver - Deploy CSR auto-approver CronJob for host cluster workers"
+	@echo "  delete-csr-approver - Remove CSR auto-approver from host cluster"
+	@echo "  delete-dpf-hcp-provisioner-operator - Remove DPF HCP Provisioner Operator and related resources"
 	@echo ""
-	@echo "Hypershift Management:"
+	@echo "Verification:"
+	@echo "  verify-deployment     - Full verification: workers + DPU nodes + DPUDeployment"
+	@echo "  verify-workers        - Wait for worker nodes to be Ready in host cluster"
+	@echo "  verify-dpu-nodes      - Wait for DPU nodes to be Ready in DPUCluster"
+	@echo "  verify-dpudeployment  - Wait for DPUDeployment to be Ready"
+	@echo ""
+	@echo "Traffic Flow Tests:"
+	@echo "  run-traffic-flow-tests - Run kubernetes-traffic-flow-tests for network validation"
+	@echo "  tft-setup              - Setup TFT repository and Python environment only"
+	@echo "  tft-cleanup            - Remove TFT repository and virtual environment"
+	@echo "  tft-show-config        - Display current TFT configuration"
+	@echo "  tft-results            - Show results from the most recent test run"
+	@echo ""
+	@echo "Hypershift Management:
 	@echo "  install-hypershift - Install Hypershift binary and operator"
 	@echo "  create-hypershift-cluster - Create a new Hypershift hosted cluster"
 	@echo "  configure-hypershift-dpucluster - Configure DPF to use Hypershift hosted cluster"
@@ -234,7 +392,6 @@ help:
 	@echo ""
 	@echo "Feature Configuration:"
 	@echo "  DISABLE_NFD       - Skip NFD deployment (default: $(DISABLE_NFD))"
-	@echo "  NFD_OPERAND_IMAGE - (deprecated - no longer used)"
 	@echo ""
 	@echo "Hypershift Configuration:"
 	@echo "  HYPERSHIFT_IMAGE  - Hypershift operator image (default: $(HYPERSHIFT_IMAGE))"
@@ -245,7 +402,6 @@ help:
 	@echo "Network Configuration:"
 	@echo "  POD_CIDR         - Set pod CIDR (default: $(POD_CIDR))"
 	@echo "  SERVICE_CIDR     - Set service CIDR (default: $(SERVICE_CIDR))"
-	@echo "  DPU_INTERFACE    - Set DPU interface (default: $(DPU_INTERFACE))"
 	@echo "  API_VIP          - Set API VIP address"
 	@echo "  INGRESS_VIP      - Set Ingress VIP address"
 	@echo ""
@@ -255,32 +411,59 @@ help:
 	@echo "  VCPUS            - Number of vCPUs for VMs (default: $(VCPUS))"
 	@echo "  DISK_SIZE1       - Primary disk size in GB (default: $(DISK_SIZE1))"
 	@echo "  DISK_SIZE2       - Secondary disk size in GB (default: $(DISK_SIZE2))"
+	@echo "  LIBVIRT_HOST     - Remote libvirt host for VM hosting (e.g., root@192.168.1.100; default: local)"
+	@echo ""
+	@echo "VM Worker Configuration (day2 Assisted Installer flow):"
+	@echo "  VM_WORKER_COUNT      - Number of worker VMs to create (default: 0)"
+	@echo "  VM_WORKER_PREFIX     - VM name prefix for workers (default: VM_PREFIX-worker)"
+	@echo "  VM_WORKER_RAM        - RAM in MB for worker VMs (default: same as RAM)"
+	@echo "  VM_WORKER_VCPUS      - Number of vCPUs for worker VMs (default: same as VCPUS)"
+	@echo "  VM_WORKER_DISK_SIZE1 - Primary disk size in GB for worker VMs (default: same as DISK_SIZE1)"
+	@echo "  VM_WORKER_DISK_SIZE2 - Secondary disk size in GB for worker VMs (default: same as DISK_SIZE2)"
 	@echo ""
 	@echo "DPF Configuration:"
 	@echo "  DPF_VERSION      - DPF operator version (default: $(DPF_VERSION))"
-	@echo "  ETCD_STORAGE_CLASS - StorageClass for hosted cluster etcd (default: $(ETCD_STORAGE_CLASS))"
-	@echo "  BFB_STORAGE_CLASS - StorageClass for BFB PVC (default: $(BFB_STORAGE_CLASS))"
+	@echo "  SKIP_DEPLOY_STORAGE - If true, skip LSO/LVM/ODF deployment; ETCD_STORAGE_CLASS must point to existing StorageClass (default: false)"
+	@echo "  ETCD_STORAGE_CLASS - StorageClass for hosted cluster etcd (default: $(ETCD_STORAGE_CLASS)); required when SKIP_DEPLOY_STORAGE=true"
 	@echo ""
 	@echo "MetalLB Configuration:"
 	@echo "  HYPERSHIFT_API_IP     - IP address for Hypershift API server LoadBalancer"
-	@echo "                          If set: Deploys MetalLB and uses LoadBalancer for Hypershift API"
+	@echo "                          If set: Deploys MetalLB and uses LoadBalancer for Hypershift API (dpf-hcp-provisioner-operator manages IPAddressPool/L2Advertisement)"
 	@echo "                          If not set: Uses NodePort for Hypershift API (multi-node) or default (single-node)"
-	@echo ""
-	@echo "NFS Configuration:"
-	@echo "  NFS_SERVER_NODE_IP    - External NFS server IP (if set, uses external NFS; otherwise internal)"
-	@echo "  NFS_PATH              - NFS export path (default: /)"
 	@echo ""
 	@echo "Post-installation Configuration:"
 	@echo "  BFB_URL          - URL for BFB file (default: http://10.8.2.236/bfb/rhcos_4.19.0-ec.4_installer_2025-04-23_07-48-42.bfb)"
 	@echo "  HBN_OVN_NETWORK  - Network for HBN OVN IPAM (default: 10.0.120.0/22)"
 	@echo ""
-	@echo "NFS Server Setup:"
-	@echo "  setup-nfs-server - Setup NFS server with systemd service and firewall configuration"
-	@echo "                     Environment variables:"
-	@echo "                       NFS_EXPORT_DIR     - Export directory path (default: /nfs/exports)"
-	@echo "                       NFS_EXPORT_OPTIONS - Export options (default: rw,sync,no_root_squash,no_subtree_check)"
-	@echo "                       NFS_ALLOWED_NETWORK - Allowed network/host (default: *)"
-	@echo ""
 	@echo "Wait Configuration:"
 	@echo "  MAX_RETRIES      - Maximum number of retries for status checks (default: $(MAX_RETRIES))"
-	@echo "  SLEEP_TIME       - Sleep time in seconds between retries (default: $(SLEEP_TIME))" 
+	@echo "  SLEEP_TIME       - Sleep time in seconds between retries (default: $(SLEEP_TIME))"
+	@echo ""
+	@echo "Worker Node Configuration:"
+	@echo "  WORKER_COUNT          - Number of workers to provision (default: 0)"
+	@echo "  WORKER_n_NAME         - Worker hostname (e.g., WORKER_1_NAME=openshift-worker-1)"
+	@echo "  WORKER_n_BMC_IP       - BMC/iDRAC IP address for Redfish API"
+	@echo "  WORKER_n_BMC_USER     - BMC username"
+	@echo "  WORKER_n_BMC_PASSWORD - BMC password"
+	@echo "  WORKER_n_BOOT_MAC     - Boot NIC MAC address"
+	@echo "  WORKER_n_ROOT_DEVICE  - Target installation disk (e.g., /dev/sda)"
+	@echo "  WORKER_n_DPU          - Set to 'false' for regular workers, defualt is true (worker-dpu)"
+	@echo "  WORKER_NODE_LABELS    - Comma-separated labels for kubelet --node-labels (e.g., node.openshift.io/dpu-host=true)"
+	@echo ""
+	@echo "CSR Auto-Approval Configuration:"
+	@echo "  AUTO_APPROVE_WORKER_CSR     - Deploy CronJob to auto-approve CSRs for host cluster workers (default: false)"
+	@echo ""
+	@echo "Verification Configuration:"
+	@echo "  VERIFY_DEPLOYMENT    - Run verification after 'make all' completes (default: false)"
+	@echo "  VERIFY_MAX_RETRIES   - Max retry attempts for verification (default: 60)"
+	@echo "  VERIFY_SLEEP_SECONDS - Seconds between verification retries (default: 30)"
+	@echo ""
+	@echo "Traffic Flow Tests Configuration:"
+	@echo "  TFT_REPO_URL         - TFT git repository URL"
+	@echo "  TFT_REPO_REV         - Git revision/branch/tag to checkout (default: main)"
+	@echo "  TFT_TEST_CASES       - Test cases to run (default: 1-25)"
+	@echo "  TFT_DURATION         - Duration per test in seconds (default: 10)"
+	@echo "  TFT_CONNECTION_TYPE  - Test type: iperf-tcp, iperf-udp, etc. (default: iperf-tcp)"
+	@echo "  TFT_KUBECONFIG       - Path to cluster kubeconfig"
+	@echo "  TFT_SERVER_NODE      - K8s node name for server (default: from HBN_HOSTNAME_NODE1)"
+	@echo "  TFT_CLIENT_NODE      - K8s node name for client (default: from HBN_HOSTNAME_NODE2)"

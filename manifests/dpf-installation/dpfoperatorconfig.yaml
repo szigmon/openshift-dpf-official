@@ -12,6 +12,10 @@ spec:
   #Openshift multus is used for DPU cluster 
   multus:
     disable: true
+  cniInstaller:
+    # CNI installer isn't relevant for the OpenShift use case.
+    # In 25.10 it does not support the RHCOS BFB.
+    disable: true
   overrides:
     kubernetesAPIServerVIP: api.<CLUSTER_NAME>.<BASE_DOMAIN>
     kubernetesAPIServerPort: 6443
@@ -19,11 +23,23 @@ spec:
     dpuCNIPath: /run/multus/cni/net.d/
     # Configure lib64 path for RHCOS systems
     dpuOpenvSwitchSystemSharedLib64Path: /lib64
+    # Configure linker cache and opt library path for RHCOS systems
+    dpuLinkerCachePath: /etc/ld.so.cache
+    dpuOptLibraryPath: /usr/opt
     # When using OpenShift Multus (default), Flannel needs to install CNI config
     flannelSkipCNIConfigInstallation: false
   provisioningController:
-    bfCFGTemplateConfigMap: custom-bfb.cfg
-    bfbPVCName: bfb-pvc
+    enableDynamicBFCFGTemplates: true
+    hostAgentDNSPolicy: Default
     dmsTimeout: 900
+  nodeSRIOVDevicePluginController:
+    devicePlugin:
+      defaultResourcePrefix: <SRIOV_DP_RESOURCE_PREFIX>
+    disable: false
+    replicas: 1
   staticClusterManager:
     disable: false
+  <FLANNEL_CONFIG>
+  networking:
+    controlPlaneMTU: <NODES_MTU>
+    highSpeedMTU: <NODES_MTU>

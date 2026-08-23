@@ -1,28 +1,24 @@
+---
 apiVersion: provisioning.dpu.nvidia.com/v1alpha1
 kind: DPUFlavor
 metadata:
-  name: flavor
+  name: hbn-ovnk
   namespace: dpf-operator-system
+  annotations:
+    # Required when flavor bfcfg exceeds the DPF limit of 128K
+    provisioning.dpu.nvidia.com/skip-bfcfg-size-check: ""
 spec:
-  bfcfgParameters:
-    - UPDATE_ATF_UEFI=yes
-    - UPDATE_DPU_OS=yes
-    - WITH_NIC_FW_UPDATE=yes
-  dpuMode: dpu
   grub:
     kernelParameters:
       - console=hvc0
       - console=ttyAMA0
       - earlycon=pl011,0x13010000
-      - fixrttc
-      - net.ifnames=0
-      - biosdevname=0
       - iommu.passthrough=1
       - cgroup_no_v1=net_prio,net_cls
       - hugepagesz=2048kB
-      - hugepages=3072
+      - hugepages=250
   nvconfig:
-    - device: '*'
+    - device: "*"
       parameters:
         - PF_BAR2_ENABLE=0
         - PER_PF_NUM_SF=1
@@ -36,5 +32,119 @@ spec:
         - SRIOV_EN=1
         - NUM_OF_VFS=<NUM_VFS>
         - LAG_RESOURCE_ALLOCATION=1
+        - LINK_TYPE_P1=ETH
+        - LINK_TYPE_P2=ETH
   ovs:
-    rawConfigScript: IyEvYmluL2Jhc2gKCl9vdnMtdnNjdGwoKSB7CiAgb3ZzLXZzY3RsIC0tbm8td2FpdCAtLXRpbWVvdXQgMTUgIiRAIgp9Cgpfb3ZzLXZzY3RsIHNldCBPcGVuX3ZTd2l0Y2ggLiBvdGhlcl9jb25maWc6ZG9jYS1pbml0PXRydWUKX292cy12c2N0bCBzZXQgT3Blbl92U3dpdGNoIC4gb3RoZXJfY29uZmlnOmRwZGstbWF4LW1lbXpvbmVzPTUwMDAwCl9vdnMtdnNjdGwgc2V0IE9wZW5fdlN3aXRjaCAuIG90aGVyX2NvbmZpZzpody1vZmZsb2FkPXRydWUKX292cy12c2N0bCBzZXQgT3Blbl92U3dpdGNoIC4gb3RoZXJfY29uZmlnOnBtZC1xdWlldC1pZGxlPXRydWUKX292cy12c2N0bCBzZXQgT3Blbl92U3dpdGNoIC4gb3RoZXJfY29uZmlnOm1heC1pZGxlPTIwMDAwCl9vdnMtdnNjdGwgc2V0IE9wZW5fdlN3aXRjaCAuIG90aGVyX2NvbmZpZzptYXgtcmV2YWxpZGF0b3I9NTAwMApfb3ZzLXZzY3RsIC0taWYtZXhpc3RzIGRlbC1iciBvdnNicjEKX292cy12c2N0bCAtLWlmLWV4aXN0cyBkZWwtYnIgb3ZzYnIyCl9vdnMtdnNjdGwgLS1tYXktZXhpc3QgYWRkLWJyIGJyLXNmYwpfb3ZzLXZzY3RsIHNldCBicmlkZ2UgYnItc2ZjIGRhdGFwYXRoX3R5cGU9bmV0ZGV2Cl9vdnMtdnNjdGwgc2V0IGJyaWRnZSBici1zZmMgZmFpbF9tb2RlPXNlY3VyZQpfb3ZzLXZzY3RsIC0tbWF5LWV4aXN0IGFkZC1wb3J0IGJyLXNmYyBwMApfb3ZzLXZzY3RsIHNldCBJbnRlcmZhY2UgcDAgdHlwZT1kcGRrCl9vdnMtdnNjdGwgc2V0IEludGVyZmFjZSBwMCBtdHVfcmVxdWVzdD05MjE2Cl9vdnMtdnNjdGwgc2V0IFBvcnQgcDAgZXh0ZXJuYWxfaWRzOmRwZi10eXBlPXBoeXNpY2FsCl9vdnMtdnNjdGwgLS1tYXktZXhpc3QgYWRkLXBvcnQgYnItc2ZjIHAxCl9vdnMtdnNjdGwgc2V0IEludGVyZmFjZSBwMSB0eXBlPWRwZGsKX292cy12c2N0bCBzZXQgSW50ZXJmYWNlIHAxIG10dV9yZXF1ZXN0PTkyMTYKX292cy12c2N0bCBzZXQgUG9ydCBwMSBleHRlcm5hbF9pZHM6ZHBmLXR5cGU9cGh5c2ljYWwKCiMgQWN0aXZhdGUgRE9DQSBmb3IgT1ZOSwpfb3ZzLXZzY3RsIHNldCBPcGVuX3ZTd2l0Y2ggLiBleHRlcm5hbC1pZHM6b3ZuLWJyaWRnZS1kYXRhcGF0aC10eXBlPW5ldGRldgojIHNldHVwIG92bmt1YmUgbWFuYWdlZCBicmlkZ2UsIGJyLWRwdSAodGhpcyBjb3JyZXNwb25kcyB0byBici1leCBvbiBvdm5rIGRvY3MpCl9vdnMtdnNjdGwgLS1tYXktZXhpc3QgYWRkLWJyIGJyLWRwdQpfb3ZzLXZzY3RsIGJyLXNldC1leHRlcm5hbC1pZCBici1kcHUgYnJpZGdlLWlkIGJyLWRwdQpfb3ZzLXZzY3RsIGJyLXNldC1leHRlcm5hbC1pZCBici1kcHUgYnJpZGdlLXVwbGluayBwYnJkcHV0b2Jyb3ZuCl9vdnMtdnNjdGwgc2V0IGJyaWRnZSBici1kcHUgZGF0YXBhdGhfdHlwZT1uZXRkZXYKX292cy12c2N0bCAtLW1heS1leGlzdCBhZGQtcG9ydCBici1kcHUgcGYwaHBmCl9vdnMtdnNjdGwgc2V0IEludGVyZmFjZSBwZjBocGYgbXR1X3JlcXVlc3Q9OTIxNgpfb3ZzLXZzY3RsIHNldCBJbnRlcmZhY2UgcGYwaHBmIHR5cGU9ZHBkawoKIyBDcmVhdGUgc3dpdGNoaW5nIE9WUyBicmlkZ2UgaW4gYmV0d2VlbiB0aGUgU0MgbWFuYWdlZCBicmlkZ2UgYW5kIE9WTksKX292cy12c2N0bCAtLW1heS1leGlzdCBhZGQtYnIgYnItb3ZuCl9vdnMtdnNjdGwgc2V0IGJyaWRnZSBici1vdm4gZGF0YXBhdGhfdHlwZT1uZXRkZXYKX292cy12c2N0bCAtLW1heS1leGlzdCBhZGQtcG9ydCBici1vdm4gcGJyb3ZudG9icmRwdQpfb3ZzLXZzY3RsIC0tbWF5LWV4aXN0IGFkZC1wb3J0IGJyLWRwdSBwYnJkcHV0b2Jyb3ZuCgojIFBhdGNoIGJyLW92biBhbmQgYnItZHB1IHRvZ2V0aGVyCl9vdnMtdnNjdGwgc2V0IGludGVyZmFjZSBwYnJvdm50b2JyZHB1IHR5cGU9cGF0Y2ggb3B0aW9uczpwZWVyPXBicmRwdXRvYnJvdm4KX292cy12c2N0bCBzZXQgaW50ZXJmYWNlIHBicmRwdXRvYnJvdm4gdHlwZT1wYXRjaCBvcHRpb25zOnBlZXI9cGJyb3ZudG9icmRwdQo=
+    rawConfigScript: |
+      #!/bin/bash
+      set -e
+
+      _ovs-vsctl() {
+        ovs-vsctl --timeout 15 "$@"
+      }
+
+      restart_ovs=false
+
+      _ovs-get-other-config() {
+        _ovs-vsctl --if-exists get Open_vSwitch . "other_config:$1" 2>/dev/null | tr -d '"'
+      }
+
+      _ovs-set-other-config() {
+        if [ "$(_ovs-get-other-config "$1")" != "$2" ]; then
+          _ovs-vsctl set Open_vSwitch . "other_config:$1=$2"
+          restart_ovs=true
+        fi
+      }
+
+      _ovs-remove-other-config() {
+        if [ -n "$(_ovs-get-other-config "$1")" ]; then
+          _ovs-vsctl remove Open_vSwitch . other_config "$1"
+          restart_ovs=true
+        fi
+      }
+
+      _ovs-set-other-config doca-init true
+      _ovs-set-other-config dpdk-max-memzones 50000
+      _ovs-set-other-config hw-offload true
+      _ovs-set-other-config pmd-quiet-idle true
+      _ovs-set-other-config max-idle 20000
+      _ovs-set-other-config max-revalidator 5000
+      _ovs-set-other-config doca-congestion-threshold 60
+      _ovs-set-other-config flow-limit 500000
+      _ovs-set-other-config hw-offload-ct-unidir-udp-enabled true
+      _ovs-remove-other-config default-datapath-type
+
+      if [ "$restart_ovs" = true ]; then
+        if systemctl list-unit-files openvswitch-switch.service &>/dev/null; then
+          systemctl restart openvswitch-switch
+        elif systemctl list-unit-files openvswitch.service &>/dev/null; then
+          systemctl restart openvswitch
+        fi
+      fi
+
+      _ovs-vsctl --may-exist add-br br-sfc
+      _ovs-vsctl set bridge br-sfc datapath_type=netdev
+      _ovs-vsctl set bridge br-sfc fail_mode=secure
+      _ovs-vsctl --if-exists del-br br-hbn
+      _ovs-vsctl --may-exist add-br br-hbn
+      _ovs-vsctl set bridge br-hbn datapath_type=netdev
+      _ovs-vsctl set bridge br-hbn fail_mode=secure
+      _ovs-vsctl --may-exist add-port br-sfc p0
+      _ovs-vsctl set Interface p0 type=dpdk
+      _ovs-vsctl set Interface p0 mtu_request=9216
+      _ovs-vsctl set Port p0 external_ids:dpf-type=physical
+
+      # Activate DOCA for OVNK
+      _ovs-vsctl set Open_vSwitch . external-ids:ovn-bridge-datapath-type=netdev
+      # setup ovnkube managed bridge, br-dpu (this corresponds to br-ex on ovnk docs)
+      _ovs-vsctl --may-exist add-br br-dpu
+      _ovs-vsctl br-set-external-id br-dpu bridge-id br-dpu
+      _ovs-vsctl br-set-external-id br-dpu bridge-uplink pbrdputobrovn
+      _ovs-vsctl set bridge br-dpu datapath_type=netdev
+      _ovs-vsctl --may-exist add-port br-dpu pf0hpf
+      _ovs-vsctl set Interface pf0hpf type=dpdk
+
+      # Create OVS bridge (br-ovn) in between the SC managed bridge and OVNK
+      _ovs-vsctl --may-exist add-br br-ovn
+      _ovs-vsctl set bridge br-ovn datapath_type=netdev
+      _ovs-vsctl --may-exist add-port br-ovn pbrovntobrdpu
+      _ovs-vsctl --may-exist add-port br-dpu pbrdputobrovn
+
+      # Patch br-ovn and br-dpu together
+      _ovs-vsctl set Interface pbrovntobrdpu type=patch options:peer=pbrdputobrovn
+      _ovs-vsctl set Interface pbrdputobrovn type=patch options:peer=pbrovntobrdpu
+
+  # openshift-dpf currently performs all three updates unconditionally via
+  # dpu-fw-upgrade.sh (ignition).
+  # TODO: enable once parameters are implemented by dpu-fw-upgrade.sh
+  # bfcfgParameters:
+  #   - UPDATE_ATF_UEFI=yes
+  #   - UPDATE_DPU_OS=yes
+  #   - WITH_NIC_FW_UPDATE=yes
+
+  # TODO: enable once hostagent NM backend is fully implemented
+  # hostNetworkInterfaceConfigs:
+  #   - portNumber: 0
+  #     dhcp: true
+  #     mtu: 1500
+
+  # These files are currently created via ignition.
+  # TODO: enable once configFiles is implemented and ignition handling is removed
+  # configFiles:
+  # - path: /etc/mellanox/mlnx-bf.conf
+  #   operation: override
+  #   raw: |
+  #       ALLOW_SHARED_RQ="no"
+  #       IPSEC_FULL_OFFLOAD="no"
+  #       ENABLE_ESWITCH_MULTIPORT="yes"
+  #   permissions: "0644"
+  # - path: /etc/mellanox/mlnx-ovs.conf
+  #   operation: override
+  #   raw: |
+  #       CREATE_OVS_BRIDGES="no"
+  #       OVS_DOCA="yes"
+  #   permissions: "0644"
+  # - path: /etc/mellanox/mlnx-sf.conf
+  #   operation: override
+  #   raw: ""
+  #   permissions: "0644"

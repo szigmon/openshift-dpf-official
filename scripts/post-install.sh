@@ -15,6 +15,7 @@ MANIFESTS_DIR=${MANIFESTS_DIR:-"manifests"}
 POST_INSTALL_DIR="${MANIFESTS_DIR}/post-installation"
 GENERATED_DIR=${GENERATED_DIR:-"$MANIFESTS_DIR/generated"}
 GENERATED_POST_INSTALL_DIR="${GENERATED_DIR}/post-install"
+OBSERVABILITY_DIR="${MANIFESTS_DIR}/observability"
 
 # BFB Configuration with defaults
 BFB_URL=${BFB_URL:-"http://10.8.2.236/bfb/rhcos_4.19.0-ec.4_installer_2025-04-23_07-48-42.bfb"}
@@ -33,15 +34,11 @@ SPECIAL_FILES=(
     "dpuflavor-1500.yaml"
     "dpuflavor-9000.yaml"
     "dpuflavor.yaml"
-    "sriov-policy.yaml"
-    "ovn-template.yaml"
     "ovn-configuration.yaml"
-    "hbn-template.yaml"
     "hbn-configuration.yaml"
-    "dts-template.yaml"
-    "blueman-template.yaml"
     "dpu-node-ipam-controller.yaml"
     "dpudeployment.yaml"
+    "nodesriovdevicepluginconfig.yaml"
 )
 
 # Function to update BFB manifest
@@ -61,7 +58,7 @@ function update_bfb_manifest() {
 # Function to update HBN OVN manifests
 function update_hbn_ovn_manifests() {
     log [INFO] "Updating HBN OVN manifests..."
-    
+
     # DPU_HOST_CIDR must be set by user
     if [ -z "${DPU_HOST_CIDR}" ]; then
         log [ERROR] "DPU_HOST_CIDR environment variable is not set. Please set it to the DPU nodes subnet (e.g., 10.6.135.0/24)"
@@ -73,36 +70,6 @@ function update_hbn_ovn_manifests() {
         "${GENERATED_POST_INSTALL_DIR}/hbn-ovn-ipam.yaml" \
         "<HBN_OVN_NETWORK>" \
         "${HBN_OVN_NETWORK}"
-    
-    # Skip ovn-dpuservice.yaml - now handled by DPUDeployment
-    # Services are now managed through DPUDeployment with templates and configurations
-    
-    # Update ovn-template.yaml for DPUDeployment
-    if [ -f "${POST_INSTALL_DIR}/ovn-template.yaml" ]; then
-        # Determine the replacement value for <OVN_KUBERNETES_UTILS_IMAGES>
-        local utils_images_replacement=""
-        if [ -n "${OVN_KUBERNETES_UTILS_IMAGE_REPO}" ] && [ -n "${OVN_KUBERNETES_UTILS_IMAGE_TAG}" ]; then
-            # Build the imagedpf block with proper indentation (8 spaces for imagedpf:, 10 spaces for repository/tag)
-            utils_images_replacement="imagedpf:
-          repository: ${OVN_KUBERNETES_UTILS_IMAGE_REPO}
-          tag: ${OVN_KUBERNETES_UTILS_IMAGE_TAG}"
-            log [INFO] "OVN_KUBERNETES_UTILS_IMAGE_REPO and OVN_KUBERNETES_UTILS_IMAGE_TAG set, including imagedpf section in ovn-template.yaml" 
-        else
-            log [INFO] "OVN_KUBERNETES_UTILS_IMAGE_REPO or OVN_KUBERNETES_UTILS_IMAGE_TAG not set, omitting imagedpf section from ovn-template.yaml"
-        fi
-        
-        # Use update_file_multi_replace for all replacements
-        update_file_multi_replace \
-            "${POST_INSTALL_DIR}/ovn-template.yaml" \
-            "${GENERATED_POST_INSTALL_DIR}/ovn-template.yaml" \
-            "<DPF_VERSION>" "${DPF_VERSION}" \
-            "<OVN_CHART_VERSION>" "${OVN_CHART_VERSION}" \
-            "<OVN_TEMPLATE_CHART_URL>" "${OVN_TEMPLATE_CHART_URL}" \
-            "<OVN_KUBERNETES_IMAGE_REPO>" "${OVN_KUBERNETES_IMAGE_REPO}" \
-            "<OVN_KUBERNETES_IMAGE_TAG>" "${OVN_KUBERNETES_IMAGE_TAG}" \
-            "<OVN_KUBERNETES_UTILS_IMAGES>" "${utils_images_replacement}" \
-            "<OVN_CHART_URL>" "${OVN_CHART_URL}"
-    fi
 
     # Update ovn-configuration.yaml for DPUDeployment
     if [ -f "${POST_INSTALL_DIR}/ovn-configuration.yaml" ]; then
@@ -113,6 +80,7 @@ function update_hbn_ovn_manifests() {
         else
             ovn_mtu=1400
         fi
+
         log "INFO" "ovn-configuration will be set with MTU:$ovn_mtu"
         update_file_multi_replace \
             "${POST_INSTALL_DIR}/ovn-configuration.yaml" \
@@ -122,8 +90,8 @@ function update_hbn_ovn_manifests() {
             "<DPU_HOST_CIDR>" "${DPU_HOST_CIDR}" \
             "<NODES_MTU>" "${ovn_mtu}"
     fi
-    
-    # Update hbn-configuration.yaml 
+
+    # Update hbn-configuration.yaml
     if [ -f "${POST_INSTALL_DIR}/hbn-configuration.yaml" ]; then
         update_file_multi_replace \
             "${POST_INSTALL_DIR}/hbn-configuration.yaml" \
@@ -136,7 +104,7 @@ function update_hbn_ovn_manifests() {
 # Function to update VF configuration
 function update_vf_configuration() {
     log [INFO] "Updating VF configuration in manifests..."
-    
+
     # Calculate VF range upper bound
     local vf_range_upper=$((NUM_VFS - 1))
 
@@ -147,70 +115,52 @@ function update_vf_configuration() {
     fi
 
     log "INFO" "Creating unified dpuflavor.yaml from $mtu_source_file for MTU $NODES_MTU"
-    
+
     # Copy and process the appropriate source file as dpuflavor.yaml
     update_file_multi_replace \
         "${POST_INSTALL_DIR}/$mtu_source_file" \
         "${GENERATED_POST_INSTALL_DIR}/dpuflavor.yaml" \
         "<NUM_VFS>" "${NUM_VFS}"
-    
-    # Update sriov-policy.yaml
 
-    update_file_multi_replace \
-        "${POST_INSTALL_DIR}/sriov-policy.yaml" \
-        "${GENERATED_POST_INSTALL_DIR}/sriov-policy.yaml" \
-        "<DPU_INTERFACE>" "$DPU_INTERFACE" \
-        "<NUM_VFS>" "${NUM_VFS}" \
-        "<NUM_VFS-1>" "${vf_range_upper}"
-    
+
     log [INFO] "VF configuration updated successfully"
 }
 
 # Function to update service template versions
-function update_service_templates() {
-    log [INFO] "Updating service template versions..."
-    
-    # Validate DPF_VERSION is set
-    if [ -z "$DPF_VERSION" ]; then
-        log [ERROR] "DPF_VERSION is not set. Required for service template updates"
-        return 1
+function generate_dpuservicetemplate_overrides() {
+    local major_minor
+    major_minor=$(echo "${DPF_VERSION#v}" | cut -d. -f1-2)
+
+    local overrides
+    overrides=$(jq -n -f "$(dirname "${BASH_SOURCE[0]}")/dpuservicetemplate-overrides.jq" \
+        --arg major_minor "${major_minor}" \
+        --arg ovn_chart_url "${OVN_CHART_URL:-}" \
+        --arg ovn_chart_version "${OVN_CHART_VERSION:-}" \
+        --arg hbn_helm_repo_url "${HBN_HELM_REPO_URL:-}" \
+        --arg hbn_helm_chart_version "${HBN_HELM_CHART_VERSION:-}" \
+        --arg hbn_image_repo "${HBN_IMAGE_REPO:-}" \
+        --arg hbn_image_tag "${HBN_IMAGE_TAG:-}" \
+        --arg dts_helm_repo_url "${DTS_HELM_REPO_URL:-}" \
+        --arg dts_helm_chart_version "${DTS_HELM_CHART_VERSION:-}" \
+        --arg dts_image "${DTS_IMAGE:-}")
+
+    if [[ "${overrides}" == "null" ]]; then
+        log [INFO] "No DPUServiceTemplate overrides to apply"
+        return
     fi
-    
-    # Update all service templates with DPF_VERSION if they exist
-    local templates=("hbn-template.yaml" "dts-template.yaml" "blueman-template.yaml")
-    
-    for template in "${templates[@]}"; do
-        if [ -f "${POST_INSTALL_DIR}/${template}" ]; then
-            # HBN template needs helm repo URL, version, and image configuration
-            if [[ "${template}" == "hbn-template.yaml" ]]; then
-                update_file_multi_replace \
-                    "${POST_INSTALL_DIR}/${template}" \
-                    "${GENERATED_POST_INSTALL_DIR}/${template}" \
-                    "<HBN_HELM_REPO_URL>" "${HBN_HELM_REPO_URL}" \
-                    "<HBN_HELM_CHART_VERSION>" "${HBN_HELM_CHART_VERSION}" \
-                    "<HBN_IMAGE_REPO>" "${HBN_IMAGE_REPO}" \
-                    "<HBN_IMAGE_TAG>" "${HBN_IMAGE_TAG}"
-                log [INFO] "Updated ${template} with HBN helm and image configuration"
-            # DTS template needs helm repo URL and version
-            elif [[ "${template}" == "dts-template.yaml" ]]; then
-                update_file_multi_replace \
-                    "${POST_INSTALL_DIR}/${template}" \
-                    "${GENERATED_POST_INSTALL_DIR}/${template}" \
-                    "<DTS_HELM_REPO_URL>" "${DTS_HELM_REPO_URL}" \
-                    "<DTS_HELM_CHART_VERSION>" "${DTS_HELM_CHART_VERSION}"
-                log [INFO] "Updated ${template} with DTS helm configuration"
-            else
-                update_file_multi_replace \
-                    "${POST_INSTALL_DIR}/${template}" \
-                    "${GENERATED_POST_INSTALL_DIR}/${template}" \
-                    "<DPF_VERSION>" "${DPF_VERSION}"
-                log [INFO] "Updated ${template} with DPF_VERSION"
-            fi
-        fi
-    done
-    
-    # Update IPAM controller manifest
-    if [ -f "${POST_INSTALL_DIR}/dpu-node-ipam-controller.yaml" ]; then
+
+    log [INFO] "Creating DPUServiceTemplate overrides configmap in namespace ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}"
+    oc create configmap dpuservicetemplate-overrides \
+        -n "${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}" \
+        --from-literal=overrides.json="${overrides}" \
+        --dry-run=client -o yaml | oc apply -f -
+}
+
+function update_ipam_controller() {
+    # Update IPAM controller manifest (skip for OCP >= 4.22 where Hypershift handles node CIDR allocation natively)
+    if ocp_version_gte "${OPENSHIFT_VERSION}" "4.22"; then
+        log [INFO] "OCP ${OPENSHIFT_VERSION} >= 4.22: skipping dpu-node-ipam-controller (node CIDR allocation handled by Hypershift)"
+    elif [ -f "${POST_INSTALL_DIR}/dpu-node-ipam-controller.yaml" ]; then
         update_file_multi_replace \
             "${POST_INSTALL_DIR}/dpu-node-ipam-controller.yaml" \
             "${GENERATED_POST_INSTALL_DIR}/dpu-node-ipam-controller.yaml" \
@@ -218,14 +168,12 @@ function update_service_templates() {
             "<HOSTED_CLUSTER_NAME>" "${HOSTED_CLUSTER_NAME}"
         log [INFO] "Updated dpu-node-ipam-controller.yaml with namespace and cluster name"
     fi
-    
-    log [INFO] "Service template versions updated successfully"
 }
 
 
 
 function update_dpu_service_nad() {
-   local svc_file="dpu-service-nads.yaml" 
+   local svc_file="dpu-service-nads.yaml"
 
    if [ -f "${POST_INSTALL_DIR}/${svc_file}" ]; then
        update_file_multi_replace \
@@ -240,7 +188,7 @@ function update_dpu_service_nad() {
 # Function to prepare post-installation manifests
 function prepare_post_installation() {
     log [INFO] "Starting post-installation manifest preparation..."
-    
+
     # Check if post-installation directory exists
     if [ ! -d "${POST_INSTALL_DIR}" ]; then
         log [ERROR] "Post-installation directory not found: ${POST_INSTALL_DIR}"
@@ -250,43 +198,59 @@ function prepare_post_installation() {
     update_bfb_manifest
     update_hbn_ovn_manifests
     update_vf_configuration
-    update_service_templates
+    update_ipam_controller
     update_dpu_service_nad
-    
-    # Copy DPUDeployment
+    generate_dpuservicetemplate_overrides
+
+    # Process DPUDeployment template
     if [ -f "${POST_INSTALL_DIR}/dpudeployment.yaml" ]; then
-        cp "${POST_INSTALL_DIR}/dpudeployment.yaml" "${GENERATED_POST_INSTALL_DIR}/dpudeployment.yaml"
+        update_file_multi_replace \
+            "${POST_INSTALL_DIR}/dpudeployment.yaml" \
+            "${GENERATED_POST_INSTALL_DIR}/dpudeployment.yaml" \
+            "<SRIOV_DP_CONFIG_NAME>" "${SRIOV_DP_CONFIG_NAME}"
     fi
+
+    # Process NodeSRIOVDevicePluginConfig template
+    if [ ! -f "${POST_INSTALL_DIR}/nodesriovdevicepluginconfig.yaml" ]; then
+        log [ERROR] "nodesriovdevicepluginconfig.yaml not found in ${POST_INSTALL_DIR}"
+        return 1
+    fi
+    local vf_range_end=$((NUM_VFS - 1))
+    update_file_multi_replace \
+        "${POST_INSTALL_DIR}/nodesriovdevicepluginconfig.yaml" \
+        "${GENERATED_POST_INSTALL_DIR}/nodesriovdevicepluginconfig.yaml" \
+        "<SRIOV_DP_CONFIG_NAME>" "${SRIOV_DP_CONFIG_NAME}" \
+        "<NUM_VFS_END>" "${vf_range_end}"
 
     # Copy remaining manifests using utility function (exclude special files)
     copy_manifests_with_exclusions "${POST_INSTALL_DIR}" "${GENERATED_POST_INSTALL_DIR}" "${SPECIAL_FILES[@]}"
-    
+
     log [INFO] "Post-installation manifest preparation completed successfully"
 }
 
 # Function to apply post-installation manifests
 function apply_post_installation() {
     log [INFO] "Starting post-installation manifest application..."
-    
+
     # Check if generated post-installation directory exists
     if [ ! -d "${GENERATED_POST_INSTALL_DIR}" ]; then
         log [ERROR] "Generated post-installation directory not found: ${GENERATED_POST_INSTALL_DIR}"
         log [ERROR] "Please run prepare-dpu-files first"
         exit 1
     fi
-    
+
     # Get kubeconfig
     get_kubeconfig
-    
+
     # Wait for DPF provisioning webhook to be ready before applying manifests
     log [INFO] "Waiting for DPF provisioning webhook service to be ready..."
     local webhook_ready=false
     local max_attempts=30
     local attempt=0
-    
+
     while [ $attempt -lt $max_attempts ] && [ "$webhook_ready" = "false" ]; do
         attempt=$((attempt + 1))
-        
+
         # Check if webhook endpoints are available
         if oc get endpoints -n dpf-operator-system dpf-provisioning-webhook-service -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | grep -q .; then
             log [INFO] "DPF provisioning webhook service is ready"
@@ -298,7 +262,7 @@ function apply_post_installation() {
             sleep 5
         fi
     done
-    
+
     if [ "$webhook_ready" = "false" ]; then
         log [ERROR] "DPF provisioning webhook service not ready after $max_attempts attempts"
         log [ERROR] "This may cause failures when applying DPU manifests that require webhook validation"
@@ -309,7 +273,7 @@ function apply_post_installation() {
             log [WARN] "STRICT_WEBHOOK_CHECK is disabled, proceeding anyway..."
         fi
     fi
-    
+
     # Apply each YAML file in the generated post-installation directory
     for file in "${GENERATED_POST_INSTALL_DIR}"/*.yaml; do
         if [ -f "$file" ]; then
@@ -321,16 +285,16 @@ function apply_post_installation() {
                     log [INFO] "Applying SCC to hosted cluster: ${filename}"
                     local saved_kubeconfig="${KUBECONFIG}"
                     export KUBECONFIG="${HOSTED_CLUSTER_NAME}.kubeconfig"
-                    apply_manifest "$file" "true"
+                    retry 5 30  apply_manifest "$file" "true"
                     export KUBECONFIG="${saved_kubeconfig}"
                 else
                     log [INFO] "Applying post-installation manifest: ${filename}"
-                    apply_manifest "$file" "true"
+                    retry 5 30  apply_manifest "$file" "true"
                 fi
             fi
         fi
     done
-    
+
     # Apply dpudeployment.yaml last if it exists, with apply_always=true
     if [ -f "${GENERATED_POST_INSTALL_DIR}/dpudeployment.yaml" ]; then
         log [INFO] "Applying dpudeployment.yaml (last manifest)..."
@@ -338,8 +302,64 @@ function apply_post_installation() {
     else
         log [WARN] "dpudeployment.yaml not found in ${GENERATED_POST_INSTALL_DIR}"
     fi
-    
+
     log [INFO] "Post-installation manifest application completed successfully"
+}
+
+function apply_observability() {
+    log [INFO] "Starting observability manifest application..."
+
+    if [ ! -d "${OBSERVABILITY_DIR}" ]; then
+        log [ERROR] "Observability directory not found: ${OBSERVABILITY_DIR}"
+        exit 1
+    fi
+
+    get_kubeconfig
+
+    log [INFO] "Applying observability operator subscriptions..."
+    retry 5 30 apply_manifest "${OBSERVABILITY_DIR}/operators" "true"
+
+    log [INFO] "Waiting for Grafana Operator CSV to reach Succeeded..."
+    local attempts=0
+    local phase=""
+    while [ $attempts -lt 60 ]; do
+        phase=$(oc -n openshift-operators get csv \
+            -l operators.coreos.com/grafana-operator.openshift-operators= \
+            -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+        if [ "$phase" = "Succeeded" ]; then
+            break
+        fi
+        attempts=$((attempts+1))
+        sleep 10
+    done
+    if [ "$phase" != "Succeeded" ]; then
+        log [ERROR] "Grafana Operator CSV did not reach Succeeded after 10 minutes (last phase: '${phase}')"
+        return 1
+    fi
+    log [INFO] "Grafana Operator CSV is Succeeded"
+
+    log [INFO] "Applying DPF metrics manifests..."
+    retry 5 30 apply_manifest "${OBSERVABILITY_DIR}/dpf-metrics" "true"
+
+    # Works around a UWM prometheus-operator namespace-cache race where newly
+    # applied PodMonitors in dpf-operator-system aren't rendered into the
+    # Prometheus scrape config until the operator is kicked. See WA-005.
+    log [INFO] "Restarting UWM prometheus-operator to refresh PodMonitor cache..."
+    oc -n openshift-user-workload-monitoring rollout restart deploy/prometheus-operator || true
+    oc -n openshift-user-workload-monitoring rollout status deploy/prometheus-operator --timeout=120s || true
+
+    log [INFO] "Applying Grafana manifests..."
+    retry 5 30 apply_manifest "${OBSERVABILITY_DIR}/grafana" "true"
+
+    # Native OpenShift console dashboards (Observe -> Dashboards). These are
+    # ConfigMaps in openshift-config-managed labeled console.openshift.io/dashboard;
+    # they render against platform Thanos/UWM with no Grafana dependency.
+    if [ -d "${OBSERVABILITY_DIR}/console-dashboards" ]; then
+        log [INFO] "Applying OpenShift console dashboards..."
+        retry 5 30 apply_manifest "${OBSERVABILITY_DIR}/console-dashboards" "true"
+    fi
+
+    log [INFO] "Observability manifest application completed successfully"
 }
 
 function redeploy() {
@@ -365,10 +385,10 @@ function redeploy() {
 # If script is executed directly (not sourced), run the appropriate function
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     if [ $# -lt 1 ]; then
-        log [ERROR] "Usage: $0 <prepare|apply|redeploy>"
+        log [ERROR] "Usage: $0 <prepare|apply|redeploy|observability|generate-overrides>"
         exit 1
     fi
-    
+
     case "$1" in
         prepare)
             prepare_post_installation
@@ -379,9 +399,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         redeploy)
             redeploy
             ;;
+        observability)
+            apply_observability
+            ;;
+        generate-overrides)
+            generate_dpuservicetemplate_overrides
+            ;;
         *)
             log [ERROR] "Unknown command: $1"
-            log [ERROR] "Available commands: prepare, apply, redeploy"
+            log [ERROR] "Available commands: prepare, apply, redeploy, observability, generate-overrides"
             exit 1
             ;;
     esac

@@ -9,8 +9,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/utils.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/cluster.sh"
 
-
-
 # Configuration
 # Most VM configuration variables are defined in env.sh:
 # VM_PREFIX, VM_COUNT, API_VIP, BRIDGE_NAME, DISK_PATH, RAM, VCPUS, DISK_SIZE1, DISK_SIZE2
@@ -21,6 +19,87 @@ PHYSICAL_NIC=${PHYSICAL_NIC:-$(ip route | awk '/default/ {print $5; exit}')}
 # ISO path derived from env.sh variables
 ISO_PATH="${ISO_FOLDER}/${CLUSTER_NAME}.iso"
 
+# -----------------------------------------------------------------------------
+# Shared helpers
+# -----------------------------------------------------------------------------
+
+generate_mac_with_custom_prefix() {
+    local vm_index="$1"
+    local custom_prefix="$2"
+    if [[ ! "$custom_prefix" =~ ^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}$ ]]; then
+        log "ERROR" "Invalid MAC_PREFIX format: $custom_prefix. Must be 4 hex digits with colon (e.g., 'C0:00', 'A1:B2')"
+        exit 1
+    fi
+    printf '52:54:00:%s:%02x' "$custom_prefix" "$vm_index"
+}
+
+# Generate MAC for a VM, using MAC_PREFIX if set, otherwise machine-id.
+# Args: vm_name mac_index
+_resolve_mac() {
+    local vm_name="$1" mac_index="$2"
+    if [ -n "$MAC_PREFIX" ]; then
+        generate_mac_with_custom_prefix "$mac_index" "$MAC_PREFIX"
+    else
+        generate_mac_from_machine_id "$vm_name"
+    fi
+}
+
+_delete_vms_by_prefix() {
+    local prefix="$1"
+    if [ -z "${prefix}" ]; then
+        log "WARN" "No VM prefix provided, skipping deletion"
+        return 0
+    fi
+    log "INFO" "Deleting VMs matching prefix ${prefix}..."
+    local vms
+    vms=$(lvirsh list --all | awk '{print $2}' | grep "^${prefix}" || true)
+    for vm in ${vms}; do
+        lvirsh destroy "${vm}" 2>/dev/null || true
+        lvirsh undefine "${vm}" --remove-all-storage --nvram 2>/dev/null \
+            || lvirsh undefine "${vm}" --remove-all-storage 2>/dev/null || true
+    done
+    log "INFO" "VMs matching prefix ${prefix} deleted"
+}
+
+# Create a single VM via virt-install (backgrounded).
+# Args: vm_name ram vcpus disk1 disk2 network_arg
+_create_vm() {
+    local vm_name="$1" ram="$2" vcpus="$3" disk1="$4" disk2="$5" network_arg="$6"
+    log "INFO" "Starting VM creation for $vm_name..."
+    # nohup cannot call shell functions — expand lvirt_install inline
+    nohup virt-install --connect "${LIBVIRT_URI}" --name "$vm_name" --memory "$ram" \
+            --vcpus "$vcpus" \
+            --os-variant=rhel9.4 \
+            --disk path="${DISK_PATH}/${vm_name}-disk1.qcow2",size="${disk1}" \
+            --disk path="${DISK_PATH}/${vm_name}-disk2.qcow2",size="${disk2}" \
+            --network "${network_arg}" \
+            --graphics=vnc \
+            --events on_reboot=restart \
+            --cdrom "$ISO_PATH" \
+            --cpu host-passthrough \
+            --boot uefi \
+            --noautoconsole \
+            --wait=-1 &
+}
+
+_wait_for_vms_running() {
+    local count="$1" prefix="$2"
+    local max_retries=24 interval=5
+    for i in $(seq 1 "$count"); do
+        local vm_name="${prefix}${i}"
+        local retries=0
+        until [[ "$(lvirsh domstate "$vm_name" 2>/dev/null || true)" == "running" ]]; do
+            if [[ $retries -ge $max_retries ]]; then
+                log "ERROR" "VM $vm_name did not reach running state within 2 minutes"
+                exit 1
+            fi
+            log "INFO" "Waiting for VM $vm_name to start... (Attempt: $((retries + 1))/$max_retries)"
+            sleep $interval
+            ((retries+=1))
+        done
+        log "INFO" "VM $vm_name is running"
+    done
+}
 
 # -----------------------------------------------------------------------------
 # VM Management Functions
@@ -40,41 +119,32 @@ function create_vms() {
         log "INFO" "Skipping VM creation as cluster is already installed"
         return 0
     fi
-    
+
     log "Creating VMs with prefix $VM_PREFIX..."
 
+    # Early SSH connectivity check for remote libvirt to fail fast
+    if is_remote_libvirt; then
+        if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${LIBVIRT_HOST}" true 2>/dev/null; then
+            log "ERROR" "Cannot connect to remote libvirt host: ${LIBVIRT_HOST}"
+            return 1
+        fi
+        log "INFO" "SSH connectivity to ${LIBVIRT_HOST} verified"
+    fi
+
     if [ "$SKIP_BRIDGE_CONFIG" != "true" ]; then
-        # Ensure the bridge is created before creating VMs
         echo "Creating bridge with force mode..."
-        "$(dirname "${BASH_SOURCE[0]}")/vm-bridge-ops.sh" --force
+        libvirt_host_script "BRIDGE_NAME=${BRIDGE_NAME} NODES_MTU=${NODES_MTU}" \
+            "$(dirname "${BASH_SOURCE[0]}")/vm-bridge-ops.sh" --force
     else
         echo "Skipping bridge creation as SKIP_BRIDGE_CONFIG is set to true."
     fi
 
-    # --- MAC Address Generation Functions ---
-    # from utils: generate_mac_from_machine_id
-
-    # Function to generate MAC address with custom prefix
-    generate_mac_with_custom_prefix() {
-        local vm_index="$1"
-        local custom_prefix="$2"
-        
-        # Validate custom prefix format (must be 4 hex digits with colon)
-        if [[ ! "$custom_prefix" =~ ^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}$ ]]; then
-            log "ERROR" "Invalid MAC_PREFIX format: $custom_prefix. Must be 4 hex digits with colon (e.g., 'C0:00', 'A1:B2')"
+    if [ "${VM_STATIC_IP}" = "true" ]; then
+        # Static IP mode: parse YAML and create VMs based on file content
+        if [ ! -f "$STATIC_NET_FILE" ]; then
+            log "ERROR" "VM_STATIC_IP=true but static network file not found: $STATIC_NET_FILE"
             exit 1
         fi
-        
-        # Convert VM index to hex (01, 02, 03, etc.)
-        local last_octet_hex=$(printf '%02x' "$vm_index")
-        
-        # Format: "C0:00" -> use as is
-        local mac="52:54:00:${custom_prefix}:${last_octet_hex}"
-        
-        echo "$mac"
-    }
-
-    if [ -f "$STATIC_NET_FILE" ] && [ "$NODES_MTU" != "1500" ]; then
         log "INFO" "Found static_net.yaml. Creating VMs based on file content."
         # parse the YAML into a JSON string
         VMS_CONFIG=$(python3 -c 'import yaml, json; print(json.dumps(yaml.safe_load(open("'"$STATIC_NET_FILE"'"))["static_network_config"]))')
@@ -83,99 +153,88 @@ function create_vms() {
         for interface_config in $(echo "$VMS_CONFIG" | jq -c '.[] | .interfaces[]'); do
            VM_MAC=$(echo "$interface_config" | jq -r '.["mac-address"]')
            VM_NAME="${VM_PREFIX}${i}"
+           network_full_arg="bridge=${BRIDGE_NAME},model=virtio,mac=${VM_MAC}"
 
-           network_full_arg="bridge=${BRIDGE_NAME},model=e1000e,mac=${VM_MAC}"
-
-           log "INFO" "Starting VM creation for $VM_NAME with MAC: $VM_MAC..."
-           nohup virt-install --name "$VM_NAME" --memory "$RAM" \
-                  --vcpus "$VCPUS" \
-                  --os-variant=rhel9.4 \
-                  --disk pool=default,size="${DISK_SIZE1}" \
-                  --disk pool=default,size="${DISK_SIZE2}" \
-                  --network "${network_full_arg}" \
-                  --graphics=vnc \
-                  --events on_reboot=restart \
-                  --cdrom "$ISO_PATH" \
-                  --cpu host-passthrough \
-                  --noautoconsole \
-                  --wait=-1 &
-
+           _create_vm "$VM_NAME" "$RAM" "$VCPUS" "$DISK_SIZE1" "$DISK_SIZE2" "$network_full_arg"
            i=$((i+1))
         done
-
     else
-      # --a- VM Creation Loop ---
+      # DHCP mode: VM Creation Loop
       for i in $(seq 1 "$VM_COUNT"); do
         VM_NAME="${VM_PREFIX}${i}"
-        network_mac_arg=""
+        UNIQUE_MAC=$(_resolve_mac "$VM_NAME" "$i")
+        log "INFO" "Creating VM: $VM_NAME with MAC: $UNIQUE_MAC"
+        network_full_arg="bridge=${BRIDGE_NAME},model=virtio,mac=${UNIQUE_MAC}"
 
-        # Determine MAC assignment method based on MAC_PREFIX
-        if [ -n "$MAC_PREFIX" ]; then
-            # Use custom prefix if MAC_PREFIX is specified
-            UNIQUE_MAC=$(generate_mac_with_custom_prefix "$i" "$MAC_PREFIX")
-            log "INFO" "Creating VM: $VM_NAME with custom prefix MAC: $UNIQUE_MAC"
-            network_mac_arg=",mac=${UNIQUE_MAC}"
-        else
-            # Use machine-id based MAC (default)
-            UNIQUE_MAC=$(generate_mac_from_machine_id "$VM_NAME")
-            log "INFO" "Creating VM: $VM_NAME with machine-id based MAC: $UNIQUE_MAC"
-            network_mac_arg=",mac=${UNIQUE_MAC}"
-        fi
-
-        # Construct the full --network argument string
-        network_full_arg="bridge=${BRIDGE_NAME},model=e1000e${network_mac_arg}"
-
-        # Create VM with virt-install
-        log "INFO" "Starting VM creation for $VM_NAME..."
-        nohup virt-install --name "$VM_NAME" --memory "$RAM" \
-                --vcpus "$VCPUS" \
-                --os-variant=rhel9.4 \
-                --disk pool=default,size="${DISK_SIZE1}" \
-                --disk pool=default,size="${DISK_SIZE2}" \
-                --network "${network_full_arg}" \
-                --graphics=vnc \
-                --events on_reboot=restart \
-                --cdrom "$ISO_PATH" \
-                --cpu host-passthrough \
-                --noautoconsole \
-                --wait=-1 &
+        _create_vm "$VM_NAME" "$RAM" "$VCPUS" "$DISK_SIZE1" "$DISK_SIZE2" "$network_full_arg"
       done
     fi
 
-    # Wait for all VMs to be running using retry mechanism
-    MAX_RETRIES=24  # 2 minutes (24 retries * 5s)
-    INTERVAL=5      # Check every 5 seconds
-
-    for i in $(seq 1 "$VM_COUNT"); do
-        VM_NAME="${VM_PREFIX}${i}"
-        retries=0
-        until [[ "$(virsh domstate "$VM_NAME" 2>/dev/null || true )" == "running" ]]; do
-            if [[ $retries -ge $MAX_RETRIES ]]; then
-                echo "Error: VM $VM_NAME did not reach running state within 2 minutes."
-                exit 1
-            fi
-            echo "Waiting for VM $VM_NAME to start... (Attempt: $((retries + 1))/$MAX_RETRIES)"
-            sleep $INTERVAL
-            ((retries+=1))
-        done
-        echo "VM $VM_NAME is running."
-    done
+    _wait_for_vms_running "$VM_COUNT" "$VM_PREFIX"
     log "VM creation completed successfully!"
 }
 
 function delete_vms() {
-    local prefix=${VM_PREFIX}
-    log "INFO" "Deleting VMs with prefix ${prefix}..."
-    local vms=$(virsh list --all | grep ${prefix} | awk '{print $2}')
-    for vm in ${vms}; do
-        if ! virsh destroy ${vm} 2>/dev/null; then
-            log "WARNING" "Failed to destroy VM ${vm}, continuing anyway"
+    if [ -n "${VM_WORKER_PREFIX}" ]; then
+        _delete_vms_by_prefix "${VM_WORKER_PREFIX}"
+    fi
+    _delete_vms_by_prefix "${VM_PREFIX}"
+}
+
+# -----------------------------------------------------------------------------
+# Worker VM functions (day2 flow via Assisted Installer)
+# -----------------------------------------------------------------------------
+
+function create_worker_vms() {
+    local worker_count="${VM_WORKER_COUNT:-0}"
+    if [ "${worker_count}" -eq 0 ]; then
+        log "INFO" "VM_WORKER_COUNT=0, skipping worker VM creation"
+        return 0
+    fi
+
+    log "INFO" "Creating ${worker_count} worker VM(s) with prefix ${VM_WORKER_PREFIX}..."
+
+    if [ "$SKIP_BRIDGE_CONFIG" != "true" ]; then
+        local bridge_exists=false
+        libvirt_host_cmd ip link show "${BRIDGE_NAME}" &>/dev/null && bridge_exists=true
+        if [ "$bridge_exists" = false ]; then
+            log "INFO" "Bridge ${BRIDGE_NAME} not found, creating..."
+            libvirt_host_script "BRIDGE_NAME=${BRIDGE_NAME} NODES_MTU=${NODES_MTU}" \
+                "$(dirname "${BASH_SOURCE[0]}")/vm-bridge-ops.sh" --force
         fi
-        if ! virsh undefine ${vm} --remove-all-storage 2>/dev/null; then
-            log "WARNING" "Failed to undefine VM ${vm}, continuing anyway"
+    fi
+
+    local created=0
+    for i in $(seq 1 "$worker_count"); do
+        local vm_name="${VM_WORKER_PREFIX}${i}"
+
+        if lvirsh dominfo "$vm_name" &>/dev/null; then
+            log "INFO" "Worker VM $vm_name already exists, skipping"
+            continue
         fi
+
+        local mac_index=$(( VM_COUNT + i ))
+        local mac=$(_resolve_mac "$vm_name" "$mac_index")
+        log "INFO" "Creating worker VM: $vm_name with MAC: $mac"
+        local network_full_arg="bridge=${BRIDGE_NAME},model=virtio,mac=${mac}"
+
+        _create_vm "$vm_name" "$VM_WORKER_RAM" "$VM_WORKER_VCPUS" "$VM_WORKER_DISK_SIZE1" "$VM_WORKER_DISK_SIZE2" "$network_full_arg"
+        ((created++)) || true
     done
-    log "INFO" "VMs with prefix ${prefix} deleted successfully"
+
+    if [ "${created}" -eq 0 ]; then
+        log "INFO" "All ${worker_count} worker VM(s) already exist, nothing to create"
+        return 0
+    fi
+
+    _wait_for_vms_running "$worker_count" "$VM_WORKER_PREFIX"
+    log "INFO" "Worker VM creation completed successfully!"
+}
+
+function delete_worker_vms() {
+    if [ -n "${VM_WORKER_PREFIX}" ]; then
+        _delete_vms_by_prefix "${VM_WORKER_PREFIX}"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -186,29 +245,23 @@ function main() {
     shift
 
     case "$command" in
-        create)
-            create_vms
-            ;;
-        delete)
-            delete_vms
-            ;;
+        create)            create_vms ;;
+        delete)            delete_vms ;;
+        create-worker-vms) create_worker_vms ;;
+        delete-worker-vms) delete_worker_vms ;;
         *)
             log "Unknown command: $command"
-            log "Available commands: create, delete"
+            log "Available commands: create, delete, create-worker-vms, delete-worker-vms"
             exit 1
             ;;
     esac
 }
 
-# If script is executed directly (not sourced), run the main function
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     if [ $# -lt 1 ]; then
         log "Usage: $0 <command> [arguments...]"
-        log "Commands:"
-        log "  create - Create VMs for the cluster"
-        log "  delete - Delete VMs with the specified prefix"
+        log "Commands: create, delete, create-worker-vms, delete-worker-vms"
         exit 1
     fi
-    
     main "$@"
 fi

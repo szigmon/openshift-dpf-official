@@ -15,9 +15,6 @@
 set -e
 set -o pipefail
 
-# Source environment variables
-source "$(dirname "$0")/env.sh"
-
 # Source common utilities
 source "$(dirname "${BASH_SOURCE[0]}")/utils.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/update-etc-hosts.sh"
@@ -50,12 +47,23 @@ function validate_vips() {
 }
 
 function is_valid_ip() {
-    local ip=$1
-    if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $ip =~ ^([0-9a-fA-F]*:[0-9a-fA-F]*){2,}$ ]]; then
-        return 0
-    else
+    local ip="$1"
+
+    if [[ "$ip" =~ [[:space:]] ]]; then
         return 1
     fi
+
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        IFS='.' read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if (( octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -87,39 +95,171 @@ function check_cluster_installed() {
     return 1
 }
 
-function set_cluster_mtu() {
-    if ! [[ "$NODES_MTU" =~ ^[0-9]+$ ]]; then
-          log "ERROR" "NODES_MTU must be a positive integer, got: $NODES_MTU"
-          return 1
-    fi
-    if [ -f "$STATIC_NET_FILE" ]; then
-        rm "$STATIC_NET_FILE"
-    fi
-    echo "static_network_config:" >> "$STATIC_NET_FILE"
+function validate_static_ip_vars() {
+    for var in VM_EXT_IPS VM_EXT_PL VM_GW VM_DNS; do
+        if [[ -z "${!var}" ]]; then
+            log "ERROR" "VM_STATIC_IP is enabled but $var is not set"
+            return 1
+        fi
+    done
 
-    for i in $(seq 1 "$VM_COUNT"); do
-        VM_NAME="${VM_PREFIX}${i}"
+    if ! [[ "$VM_EXT_PL" =~ ^([1-9]|[1-2][0-9]|3[0-2])$ ]]; then
+        log "ERROR" "VM_EXT_PL must be a valid prefix length (1-32), got: $VM_EXT_PL"
+        return 1
+    fi
+}
 
-        # Use machine-id based MAC (default)
-        if ! UNIQUE_MAC=$(generate_mac_from_machine_id "$VM_NAME"); then
-            log "ERROR" "Failed to generate MAC for $VM_NAME"
+function validate_static_ips() {
+    IFS=',' read -ra IP_ARRAY <<< "$VM_EXT_IPS"
+    IP_ARRAY=("${IP_ARRAY[@]// /}")
+
+    if [[ "${#IP_ARRAY[@]}" -lt "$VM_COUNT" ]]; then
+        log "ERROR" "Not enough IPs in VM_EXT_IPS (got ${#IP_ARRAY[@]}, need $VM_COUNT)"
+        return 1
+    fi
+
+    for ip in "${IP_ARRAY[@]}"; do
+        if ! is_valid_ip "$ip"; then
+            log "ERROR" "Invalid IP address in VM_EXT_IPS: $ip"
+            return 1
+        fi
+    done
+}
+
+function validate_gw_dns() {
+    if ! is_valid_ip "$VM_GW"; then
+        log "ERROR" "Invalid IP for VM_GW: $VM_GW"
+        return 1
+    fi
+
+    IFS=',' read -ra DNS_ARRAY <<< "$VM_DNS"
+    DNS_ARRAY=("${DNS_ARRAY[@]// /}")
+
+    local dns_count=0
+    for dns_ip in "${DNS_ARRAY[@]}"; do
+        [[ -z "$dns_ip" ]] && continue
+        if ! is_valid_ip "$dns_ip"; then
+            log "ERROR" "Invalid IP in VM_DNS: $dns_ip"
+            return 1
+        fi
+        ((dns_count++)) || true
+    done
+
+    if [[ "$dns_count" -eq 0 ]]; then
+        log "ERROR" "VM_DNS must contain at least one valid DNS server IP"
+        return 1
+    fi
+}
+
+function build_dns_yaml() {
+    DNS_SERVERS_YAML=""
+    IFS=',' read -ra DNS_ARRAY <<< "$VM_DNS"
+    DNS_ARRAY=("${DNS_ARRAY[@]// /}")
+    for d in "${DNS_ARRAY[@]}"; do
+        [[ -z "$d" ]] && continue
+        DNS_SERVERS_YAML="${DNS_SERVERS_YAML}                - ${d}"$'\n'
+    done
+}
+
+# Shared helper: appends DHCP NMState entries for a set of VMs.
+# Args: output_file vm_count vm_prefix mac_offset
+_generate_nmstate_dhcp_entries() {
+    local output_file="$1"
+    local count="$2"
+    local vm_prefix="$3"
+    local mac_offset="${4:-0}"
+
+    for i in $(seq 1 "$count"); do
+        local vm_name="${vm_prefix}${i}"
+        local mac_index=$(( mac_offset + i ))
+        local unique_mac
+
+        if [ -n "$MAC_PREFIX" ]; then
+            unique_mac="52:54:00:${MAC_PREFIX}:$(printf '%02x' "$mac_index")"
+        elif ! unique_mac=$(generate_mac_from_machine_id "$vm_name"); then
+            log "ERROR" "Failed to generate MAC for $vm_name"
             return 1
         fi
 
-        log "INFO" "Set MAC: $UNIQUE_MAC ,Will be set on VM: $VM_NAME"
+        log "INFO" "$vm_name: MAC=$unique_mac, MTU=${NODES_MTU}"
 
-        cat << EOF >> "$STATIC_NET_FILE"
-        - interfaces: 
-           - name: ${PRIMARY_IFACE:-enp1s0}
+        cat << EOF >> "$output_file"
+        - interfaces:
+           - name: ${PRIMARY_IFACE}
              type: ethernet
              state: up
              mtu: ${NODES_MTU}
-             mac-address: '${UNIQUE_MAC}'
+             mac-address: '${unique_mac}'
              ipv4:
                dhcp: true
                enabled: true
 EOF
     done
+}
+
+function set_node_nmstate() {
+
+    mkdir -p "$(dirname "$STATIC_NET_FILE")"
+    rm -f "$STATIC_NET_FILE"
+
+    if [[ "${VM_STATIC_IP}" != "true" ]] && [[ "${NODES_MTU}" == "1500" || -z "${NODES_MTU}" ]]; then
+        log "INFO" "MTU is 1500 and no static IP configured, skipping NMState configuration"
+        return 0
+    fi
+
+    echo "static_network_config:" >> "$STATIC_NET_FILE"
+
+    if [[ "${VM_STATIC_IP}" == "true" ]]; then
+        validate_static_ip_vars || return 1
+        validate_static_ips     || return 1
+        validate_gw_dns         || return 1
+        build_dns_yaml
+
+        IFS=',' read -ra IP_ARRAY <<< "$VM_EXT_IPS"
+        IP_ARRAY=("${IP_ARRAY[@]// /}")
+
+        for i in $(seq 1 "$VM_COUNT"); do
+            VM_NAME="${VM_PREFIX}${i}"
+            NODE_IP="${IP_ARRAY[$((i-1))]}"
+
+            if [ -n "$MAC_PREFIX" ]; then
+                UNIQUE_MAC="52:54:00:${MAC_PREFIX}:$(printf '%02x' "$i")"
+            elif ! UNIQUE_MAC=$(generate_mac_from_machine_id "$VM_NAME"); then
+                log "ERROR" "Failed to generate MAC for $VM_NAME"
+                return 1
+            fi
+
+            log "INFO" "Set MAC: $UNIQUE_MAC, Static IP: $NODE_IP/${VM_EXT_PL}, GW: $VM_GW, DNS: $VM_DNS, Will be set on VM: $VM_NAME"
+
+            cat << EOF >> "$STATIC_NET_FILE"
+        - interfaces:
+           - name: ${PRIMARY_IFACE}
+             type: ethernet
+             state: up
+             mtu: ${NODES_MTU}
+             mac-address: '${UNIQUE_MAC}'
+             ipv4:
+               enabled: true
+               dhcp: false
+               address:
+                 - ip: ${NODE_IP}
+                   prefix-length: ${VM_EXT_PL}
+          dns-resolver:
+            config:
+              server:
+${DNS_SERVERS_YAML}
+          routes:
+            config:
+              - destination: 0.0.0.0/0
+                next-hop-address: ${VM_GW}
+                next-hop-interface: ${PRIMARY_IFACE}
+EOF
+        done
+        return 0
+    fi
+
+    # Default: DHCP mode
+    _generate_nmstate_dhcp_entries "$STATIC_NET_FILE" "$VM_COUNT" "$VM_PREFIX" 0
 }
 
 function check_create_cluster() {
@@ -131,13 +271,18 @@ function check_create_cluster() {
         return 0
     fi
 
-    if [ "${NODES_MTU}" != "1500" ] ; then
-       set_cluster_mtu || return 1
+    set_node_nmstate
+
+    local paramfile_args=()
+    if [ -f "$STATIC_NET_FILE" ]; then
+        paramfile_args=(--paramfile "${STATIC_NET_FILE}")
     fi
 
     if ! aicli info cluster ${CLUSTER_NAME} >/dev/null 2>&1; then
         log "INFO" "Cluster ${CLUSTER_NAME} not found, creating..."
-
+        
+        ensure_ssh_key_in_home || return 1
+        
         if [ "$VM_COUNT" -eq 1 ]; then
             log "INFO" "Creating single-node cluster..."
             aicli create cluster \
@@ -145,8 +290,9 @@ function check_create_cluster() {
                 -P base_dns_domain="${BASE_DOMAIN}" \
                 -P pull_secret="${OPENSHIFT_PULL_SECRET}" \
                 -P high_availability_mode=None \
+		-P public_key="${SSH_KEY}" \
                 -P user_managed_networking=True \
-		        $([ "${NODES_MTU}" != "1500" ] && echo "--paramfile ${STATIC_NET_FILE}") \
+		"${paramfile_args[@]}" \
                 "${CLUSTER_NAME}"
         else
             log "INFO" "Creating multi-node cluster..."
@@ -160,7 +306,7 @@ function check_create_cluster() {
                 -P pull_secret="${OPENSHIFT_PULL_SECRET}" \
                 -P public_key="${SSH_KEY}" \
                 -P ingress_vips="${INGRESS_VIPS}" \
-		        $([ "${NODES_MTU}" != "1500" ] && echo "--paramfile ${STATIC_NET_FILE}") \
+                "${paramfile_args[@]}" \
                 "${CLUSTER_NAME}"
         fi
         
@@ -220,6 +366,9 @@ function start_cluster_installation() {
     if check_cluster_installed; then
         log "INFO" "Cluster ${CLUSTER_NAME} is already installed. Fetching kubeconfig..."
         get_kubeconfig
+        if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
+            validate_storage_classes_available || return 1
+        fi
         return 0
     fi
 
@@ -228,14 +377,23 @@ function start_cluster_installation() {
     aicli start cluster ${CLUSTER_NAME}
     log "INFO" "Waiting for cluster to be finalizing..."
     wait_for_cluster_status "finalizing"
+
     log "INFO" "Waiting for installation to complete..."
     wait_for_cluster_status "installed"
     log "INFO" "Cluster installation completed successfully"
     get_kubeconfig
-    if [ "${USE_V419_WORKAROUND}" == "true" ]; then
-        log "INFO" "Using v4.19 workaround. Deploying LSO and ODF..."
+
+    if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
+        log "INFO" "SKIP_DEPLOY_STORAGE=true: validating that required StorageClasses exist (user-provided storage)..."
+        validate_storage_classes_available
+        log "INFO" "Skipping LSO/ODF deployment; using existing StorageClasses."
+    elif [ "${STORAGE_TYPE}" == "odf" ]; then
+        log "INFO" "STORAGE_TYPE=odf detected. Deploying LSO and ODF..."
         deploy_lso
         deploy_odf
+    elif [[ "${OLM_WORKAROUND}" == "true" ]]; then
+        log "INFO" "OLM_WORKAROUND=true: deploying LVM via subscription (using catalog ${CATALOG_SOURCE_NAME})"
+        deploy_lvm
     fi
 }
 
@@ -274,6 +432,26 @@ function get_kubeconfig() {
     fi
 }
 
+function get_kubeadmin_password() {
+    log "INFO" "Downloading kubeadmin password for cluster ${CLUSTER_NAME}..."
+    
+    if ! aicli download kubeadmin-password "${CLUSTER_NAME}"; then
+        log "ERROR" "Failed to download kubeadmin password for cluster ${CLUSTER_NAME}"
+        return 1
+    fi
+    
+    local password_file="kubeadmin-password.${CLUSTER_NAME}"
+    if [ -f "${password_file}" ]; then
+        log "INFO" "Kubeadmin password downloaded to: ${password_file}"
+        log "INFO" "Password: $(cat "${password_file}")"
+        log "INFO" "You can use this password to connect to the OpenShift console at:"
+        log "INFO" "  https://console-openshift-console.apps.${CLUSTER_NAME}.${BASE_DOMAIN}"
+        log "INFO" "  Username: kubeadmin"
+    else
+        log "WARN" "Password file not found at expected location: ${password_file}"
+    fi
+}
+
 function clean_all() {
     log "Performing full cleanup of cluster and VMs..."
     
@@ -281,13 +459,77 @@ function clean_all() {
     delete_cluster
     
     # Delete VMs
-    log "INFO" "Deleting VMs with prefix $VM_PREFIX..."
-    env VM_PREFIX="$VM_PREFIX" scripts/delete_vms.sh || true
+    if [ -n "${VM_PREFIX}" ]; then
+        log "INFO" "Deleting VMs with prefix $VM_PREFIX..."
+        scripts/vm.sh delete || true
+    else
+        log "WARN" "VM_PREFIX is empty, skipping VM deletion"
+    fi
     
     # Clean resources
     clean_resources
     
     log "Full cleanup complete"
+}
+
+# Validates that StorageClasses required when SKIP_DEPLOY_STORAGE=true exist in the cluster.
+# Requires KUBECONFIG to be set (cluster must be installed).
+function validate_storage_classes_available() {
+    local missing=()
+    if [ -z "${ETCD_STORAGE_CLASS}" ]; then
+        log "ERROR" "ETCD_STORAGE_CLASS is not set. Set it in .env to the name of your existing StorageClass for etcd."
+        return 1
+    fi
+    if ! oc get storageclass "${ETCD_STORAGE_CLASS}" -o name &>/dev/null; then
+        missing+=("${ETCD_STORAGE_CLASS}")
+    fi
+    if [ ${#missing[@]} -gt 0 ]; then
+        log "ERROR" "SKIP_DEPLOY_STORAGE=true but the following StorageClass(es) are not present in the cluster: ${missing[*]}"
+        log "ERROR" "Create them (e.g. via your storage operator) or set ETCD_STORAGE_CLASS to an existing StorageClass name. Current: oc get storageclass"
+        return 1
+    fi
+    log "INFO" "Required StorageClass(es) present: ETCD_STORAGE_CLASS=${ETCD_STORAGE_CLASS}"
+    return 0
+}
+
+function deploy_lvm() {
+    if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
+        log "INFO" "SKIP_DEPLOY_STORAGE=true: skipping LVM deployment"
+        return 0
+    fi
+
+    if [ "${STORAGE_TYPE}" != "lvm" ]; then
+        log "INFO" "STORAGE_TYPE=${STORAGE_TYPE}: skipping LVM deployment"
+        return 0
+    fi
+
+    log "INFO" "Deploying LVM Storage operator with catalog source ${CATALOG_SOURCE_NAME}..."
+    get_kubeconfig
+
+    if oc get subscription -n openshift-storage lvms-operator &>/dev/null; then
+        log "INFO" "LVMS subscription already exists. Skipping subscription deployment."
+    else
+        mkdir -p "$GENERATED_DIR"
+
+        process_template \
+            "${MANIFESTS_DIR}/cluster-installation/lvm/lvm-subscription.yaml" \
+            "${GENERATED_DIR}/lvm-subscription.yaml" \
+            "<CATALOG_SOURCE_NAME>" "${CATALOG_SOURCE_NAME}"
+
+        retry 12 15 oc apply -f "${GENERATED_DIR}/lvm-subscription.yaml"
+    fi
+
+    log "INFO" "Waiting for LVMS operator to be ready..."
+    wait_for_pods "openshift-storage" "app.kubernetes.io/name=lvms-operator" 60 10
+
+    if oc get lvmcluster -n openshift-storage my-lvmcluster &>/dev/null; then
+        log "INFO" "LVMCluster already exists. Skipping creation."
+    else
+        log "INFO" "Creating LVMCluster..."
+        retry 30 10 oc apply -f "${MANIFESTS_DIR}/cluster-installation/lvm/lvmcluster.yaml"
+    fi
+
+    log "INFO" "LVM Storage operator deployment completed."
 }
 
 function deploy_lso() {
@@ -335,12 +577,17 @@ function deploy_lso() {
 # Create ODF cluster as a workaround for OCS cluster creation issue
 # This is a temporary solution until the OCS cluster creation with LSO 4.19 will be fixed
 function deploy_odf() {
-    # Only deploy ODF for multi-node clusters
-    if [ "${VM_COUNT}" -le 1 ]; then
-        log "INFO" "Single-node cluster detected (VM_COUNT=${VM_COUNT}). Skipping ODF deployment."
+    if [ "${VM_COUNT}" -lt 3 ]; then
+        log "INFO" "ODF requires at least 3 nodes (VM_COUNT=${VM_COUNT}). Skipping ODF deployment."
         return 0
     fi
-    
+
+    if [ "${STORAGE_TYPE}" != "odf" ]; then
+        log "INFO" "STORAGE_TYPE is not 'odf' (current: ${STORAGE_TYPE}). Skipping ODF deployment."
+        log "INFO" "To use ODF, set STORAGE_TYPE=odf in your .env file."
+        return 0
+    fi
+
     log "INFO" "Multi-node cluster detected (VM_COUNT=${VM_COUNT}). Deploying OpenShift Data Foundation..."
     
     get_kubeconfig
@@ -450,7 +697,7 @@ function get_iso() {
     fi
 
     log "INFO" "Getting ISO URL..."
-    local iso_url="$(aicli info iso "${cluster_name}" -s)"
+    local iso_url="$(aicli info iso "${cluster_name}" -s | sed 's/\x1b\[[0-9;]*m//g')"
 
     if [ -z "${iso_url}" ]; then
         log "INFO" "No direct URL found. Use console.redhat.com to generate an ISO."
@@ -464,12 +711,120 @@ function get_iso() {
         return 0
     fi
 
-    mkdir -p "${download_path}" || true
+    # Note: remote and local use different tools (curl vs aicli), so this
+    # cannot be collapsed into a single libvirt_host_cmd call.
+    if is_remote_libvirt; then
+        log "INFO" "Downloading ISO directly on remote host ${LIBVIRT_HOST}..."
+        if ! libvirt_host_cmd mkdir -p "${download_path}" \
+            || ! libvirt_host_cmd curl -gfLo "${download_path}/${cluster_name}.iso" "${iso_url}"; then
+            log "ERROR" "Failed to download ISO on remote host ${LIBVIRT_HOST}"
+            return 1
+        fi
+    else
+        mkdir -p "${download_path}" || true
+        if ! aicli download iso "${cluster_name}" -p "${download_path}"; then
+            log "ERROR" "Failed to download ISO for cluster ${cluster_name}"
+            return 1
+        fi
+    fi
+}
 
-    if ! aicli download iso "${cluster_name}" -p "${download_path}"; then
-        log "ERROR" "Failed to download ISO for cluster ${cluster_name}"
+# -----------------------------------------------------------------------------
+# Day2 VM worker host lifecycle functions
+# -----------------------------------------------------------------------------
+
+function get_day2_cluster_id() {
+    local cluster_id
+    cluster_id=$(aicli -o json list clusters 2>/dev/null \
+        | jq -r --arg name "${CLUSTER_NAME}" '.[] | select(.name == $name and .status == "adding-hosts") | .id' \
+        | head -1)
+
+    if [ -z "${cluster_id}" ]; then
+        log "ERROR" "No day2 cluster found for ${CLUSTER_NAME} (status: adding-hosts)"
         return 1
     fi
+    echo "${cluster_id}"
+}
+
+function get_day2_infra_env_id() {
+    local infra_env_id
+    infra_env_id=$(aicli -o json list infraenvs 2>/dev/null \
+        | jq -r --arg name "${CLUSTER_NAME}" \
+          '.[] | select(.name == ($name + "_infra-env") or .name == $name) | .id' \
+        | head -1)
+
+    if [ -z "${infra_env_id}" ]; then
+        log "ERROR" "No InfraEnv found for cluster ${CLUSTER_NAME}"
+        return 1
+    fi
+    echo "${infra_env_id}"
+}
+
+function install_day2_hosts() {
+    local expected_count="${VM_WORKER_COUNT:-0}"
+    if [ "${expected_count}" -eq 0 ]; then
+        log "INFO" "VM_WORKER_COUNT=0, skipping day2 host installation"
+        return 0
+    fi
+
+    local cluster_id infra_env_id
+    cluster_id=$(get_day2_cluster_id) || return 1
+    infra_env_id=$(get_day2_infra_env_id) || return 1
+
+    # Wait for hosts to register via InfraEnv
+    log "INFO" "Waiting for ${expected_count} day2 host(s) to register..."
+    _check_hosts_registered() {
+        local count
+        count=$(aicli -o json list hosts 2>/dev/null \
+            | jq -r --arg ieid "${infra_env_id}" \
+              '[.[] | select(.infra_env_id == $ieid and .status == "known")] | length') || count=0
+        log "INFO" "Day2 hosts registered: ${count}/${expected_count}"
+        [ "${count}" -ge "${expected_count}" ]
+    }
+    if ! retry 60 30 _check_hosts_registered; then
+        log "ERROR" "Timeout waiting for day2 host(s) to register"
+        return 1
+    fi
+
+    # Bind unbound hosts to the cluster, then start installation
+    _bind_and_start_hosts() {
+        local host_ids
+        host_ids=$(aicli -o json list hosts 2>/dev/null \
+            | jq -r --arg ieid "${infra_env_id}" \
+              '.[] | select(.infra_env_id == $ieid and .status == "known" and (.cluster_id == null or .cluster_id == "")) | .id')
+        for host_id in ${host_ids}; do
+            log "INFO" "Binding host ${host_id} to cluster ${CLUSTER_NAME}..."
+            aicli bind host "${host_id}" --cluster "${CLUSTER_NAME}" || true
+        done
+
+        host_ids=$(aicli -o json list hosts 2>/dev/null \
+            | jq -r --arg cid "${cluster_id}" \
+              '.[] | select(.cluster_id == $cid and .status == "known") | .id')
+        for host_id in ${host_ids}; do
+            log "INFO" "Starting installation for host ${host_id}..."
+            aicli start host "${host_id}" || true
+        done
+    }
+
+    log "INFO" "Binding and installing day2 hosts..."
+    _bind_and_start_hosts
+
+    log "INFO" "Waiting for ${expected_count} day2 host(s) to complete installation..."
+    _check_hosts_installed() {
+        _bind_and_start_hosts
+        local installed_count
+        installed_count=$(aicli -o json list hosts 2>/dev/null \
+            | jq -r --arg cid "${cluster_id}" \
+              '[.[] | select(.cluster_id == $cid and (.status == "installed" or .status == "added-to-existing-cluster"))] | length') || installed_count=0
+        log "INFO" "Day2 hosts installed: ${installed_count}/${expected_count}"
+        [ "${installed_count}" -ge "${expected_count}" ]
+    }
+    if ! retry 120 60 _check_hosts_installed; then
+        log "ERROR" "Timeout waiting for day2 hosts to complete installation"
+        return 1
+    fi
+
+    log "INFO" "All ${expected_count} day2 host(s) installed successfully"
 }
 
 # -----------------------------------------------------------------------------
@@ -495,22 +850,43 @@ function main() {
         get-kubeconfig)
             get_kubeconfig
             ;;
+        get-kubeadmin-password)
+            get_kubeadmin_password
+            ;;
         clean-all)
             clean_all
             ;;
         download-iso)
-            # Download ISO for master nodes
             get_iso "${CLUSTER_NAME}" "day1" "download"
             ;;
         get-day2-iso)
-            # Get worker ISO URL
             get_iso "${CLUSTER_NAME}" "day2" "url"
+            ;;
+        download-day2-iso)
+            # Apply worker NMState (MTU) to InfraEnv before downloading the ISO
+            if [ "${VM_WORKER_COUNT:-0}" -gt 0 ] && [ "${NODES_MTU}" != "1500" ]; then
+                log "INFO" "Generating worker NMState config (MTU=${NODES_MTU})..."
+                mkdir -p "$(dirname "$WORKER_STATIC_NET_FILE")"
+                rm -f "$WORKER_STATIC_NET_FILE"
+                echo "static_network_config:" >> "$WORKER_STATIC_NET_FILE"
+                _generate_nmstate_dhcp_entries "$WORKER_STATIC_NET_FILE" "$VM_WORKER_COUNT" "$VM_WORKER_PREFIX" "$VM_COUNT"
+                local infra_env_id
+                infra_env_id=$(get_day2_infra_env_id) || exit 1
+                aicli update infraenv "${infra_env_id}" --paramfile "${WORKER_STATIC_NET_FILE}"
+            fi
+            get_iso "${CLUSTER_NAME}" "day2" "download"
             ;;
         create-day2-cluster)
             create_day2_cluster
             ;;
+        install-day2-hosts)
+            install_day2_hosts
+            ;;
         deploy-lso)
             deploy_lso
+            ;;
+        deploy-lvm)
+            deploy_lvm
             ;;
         deploy-odf)
             deploy_odf
@@ -518,7 +894,10 @@ function main() {
         *)
             log "Unknown command: $command"
             log "Available commands: check-create-cluster, delete-cluster, cluster-install,"
-            log "  wait-for-status, get-kubeconfig, clean-all, download-iso, create-day2-cluster, get-day2-iso, deploy-lso, deploy-odf"
+            log "  wait-for-status, get-kubeconfig, get-kubeadmin-password, clean-all,"
+            log "  download-iso, download-day2-iso, create-day2-cluster, get-day2-iso,"
+            log "  install-day2-hosts,"
+            log "  deploy-lso, deploy-lvm, deploy-odf"
             exit 1
             ;;
     esac

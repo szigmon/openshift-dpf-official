@@ -39,87 +39,6 @@ function prepare_manifests() {
 }
 
 
-function prepare_nfs() {
-    local nfs_path="${NFS_PATH:-/}"
-    
-    # Ensure generated directory exists
-    mkdir -p "$GENERATED_DIR"
-
-    if [ "${NFS_SERVER_NODE_IP}" != "" ]; then
-        log "INFO" "Using external NFS server: ${NFS_SERVER_NODE_IP}:${nfs_path}"
-        update_file_multi_replace \
-            "${MANIFESTS_DIR}/nfs/nfs-pv.yaml" \
-            "${GENERATED_DIR}/nfs-pv.yaml" \
-            "<NFS_SERVER_NODE_IP>" "${NFS_SERVER_NODE_IP}" \
-            "<NFS_PATH>" "${nfs_path}"
-        return 0
-    fi
-
-    if [ -z "${ETCD_STORAGE_CLASS}" ]; then
-        log "ERROR" "ETCD_STORAGE_CLASS is not set but required for internal NFS deployment"
-        return 1
-    fi
-
-    if [[ "${VM_COUNT}" -lt 2 ]]; then
-        # For SNO clusters, deploy internal NFS server without specific node affinity
-        log "INFO" "Deploying NFS for SNO cluster"
-        node_affinity=""
-    else
-        # For multi-node clusters, deploy internal NFS server on a specific master
-        log "INFO" "Deploying NFS for multi-node cluster on a specific master"
-
-        # Get a random master node hostname and IP
-        log "INFO" "Selecting a random master node for NFS deployment"
-        selected_master_node=$(oc get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
-
-        if [ -z "${selected_master_node}" ]; then
-            log "ERROR" "Failed to retrieve master node hostname"
-            return 1
-        fi
-       
-        log "INFO" "Selected master node: ${selected_master_node}"
-
-        # Get the internal IP of the selected master
-        selected_master_ip=$(oc get node "${selected_master_node}" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
-
-        if [ -z "${selected_master_ip}" ]; then
-            log "ERROR" "Failed to retrieve IP address for master node: ${selected_master_node}"
-            return 1
-        fi
-
-        log "INFO" "Selected master IP: ${selected_master_ip}"
-
-        # Build node affinity YAML block (properly indented with 6 spaces)
-        node_affinity="affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/hostname
-                operator: In
-                values:
-                - ${selected_master_node}"
-
-        # Set HOST_CLUSTER_API to the selected master IP
-        HOST_CLUSTER_API="${selected_master_ip}"
-    fi
-
-
-    update_file_multi_replace \
-        "${MANIFESTS_DIR}/nfs/nfs.yaml" \
-        "${GENERATED_DIR}/nfs.yaml" \
-        "<STORAGECLASS_NAME>" "${ETCD_STORAGE_CLASS}" \
-        "<NODE_AFFINITY>" "${node_affinity}"
-
-
-    update_file_multi_replace \
-        "${MANIFESTS_DIR}/nfs/nfs-pv.yaml" \
-        "${GENERATED_DIR}/nfs-pv.yaml" \
-        "<NFS_SERVER_NODE_IP>" "${HOST_CLUSTER_API}" \
-        "<NFS_PATH>" "${nfs_path}"
-}
-
-
 function prepare_cluster_manifests() {
     log [INFO] "Preparing cluster installation manifests..."
     
@@ -131,14 +50,26 @@ function prepare_cluster_manifests() {
         "ovn-values.yaml"
         "ovn-values-with-injector.yaml"
         "nfd-subscription.yaml"
-        "sriov-subscription.yaml"
-        "99-worker-bridge.yaml"
+        "openshift-cert-manager.yaml"
     )
 
-    if [ "${USE_V419_WORKAROUND}" != "true" ]; then
-        excluded_files+=("4.19-cataloguesource.yaml")
+    # In SNO mode (VM_COUNT=1), exclude worker-dpu MachineConfigPool
+    # SNO uses platform "None" with Machine API in NoOp mode, so MachineSet/MCP not needed
+    if [[ "${VM_COUNT:-0}" -eq 1 ]]; then
+        log "INFO" "SNO mode detected (VM_COUNT=1), excluding worker-dpu MachineConfigPool"
+        excluded_files+=("99-worker-dpu-mcp.yaml")
     fi
-    
+
+    excluded_files+=("olm-catalogsource-template.yaml")
+
+    if [[ "${OLM_WORKAROUND}" == "true" ]]; then
+        log [INFO] "OLM_WORKAROUND enabled: generating catalog source for v${OLM_WORKAROUND_VERSION}"
+        update_file_multi_replace \
+            "$MANIFESTS_DIR/cluster-installation/olm-catalogsource-template.yaml" \
+            "$GENERATED_DIR/olm-catalogsource.yaml" \
+            "<OLM_VERSION>" "$OLM_WORKAROUND_VERSION"
+    fi
+
     # Copy all manifests except excluded files using utility function
     copy_manifests_with_exclusions "$MANIFESTS_DIR/cluster-installation" "$GENERATED_DIR" "${excluded_files[@]}"
 
@@ -150,20 +81,16 @@ function prepare_cluster_manifests() {
             "<CATALOG_SOURCE_NAME>" "$CATALOG_SOURCE_NAME"
     fi
 
-    if [ -f "$MANIFESTS_DIR/cluster-installation/sriov-subscription.yaml" ]; then
-        update_file_multi_replace \
-            "$MANIFESTS_DIR/cluster-installation/sriov-subscription.yaml" \
-            "$GENERATED_DIR/sriov-subscription.yaml" \
-            "<CATALOG_SOURCE_NAME>" "$CATALOG_SOURCE_NAME"
-    fi
-
     # Configure cluster components
     log [INFO] "Configuring cluster installation..."
     
 
     # Always copy Cert-Manager manifest (required for DPF operator)
     log [INFO] "Copying Cert-Manager manifest (required for DPF operator)..."
-    cp "$MANIFESTS_DIR/cluster-installation/openshift-cert-manager.yaml" "$GENERATED_DIR/"
+    update_file_multi_replace \
+        "$MANIFESTS_DIR/cluster-installation/openshift-cert-manager.yaml" \
+        "$GENERATED_DIR/openshift-cert-manager.yaml" \
+        "<CATALOG_SOURCE_NAME>" "$CATALOG_SOURCE_NAME"
 
     # Verify no Helm values files are in the generated directory before proceeding
     if find "$GENERATED_DIR" -maxdepth 1 -type f -name "*-values.yaml" | grep -q .; then
@@ -172,10 +99,11 @@ function prepare_cluster_manifests() {
         log "INFO" "Removed Helm values files from generated directory"
     fi
 
+
     enable_storage
 
     update_worker_manifest
-    
+
     # Install manifests to cluster
     # Check if cluster is already installed
     if check_cluster_installed; then
@@ -183,49 +111,90 @@ function prepare_cluster_manifests() {
     else
         log [INFO] "Installing manifests to cluster via AICLI..."
         aicli create manifests --dir "$GENERATED_DIR" "$CLUSTER_NAME"
+
+        # Upload openshift folder manifests (e.g., FeatureGate) to the openshift folder
+        # This is needed to override built-in OpenShift manifests like 99_feature-gate.yaml
+        local openshift_manifests_dir="$MANIFESTS_DIR/cluster-installation/openshift"
+        if [ -d "$openshift_manifests_dir" ] && [ "$(ls -A "$openshift_manifests_dir" 2>/dev/null)" ]; then
+            log [INFO] "Installing openshift folder manifests (to override built-in manifests)..."
+            aicli create manifests --dir "$openshift_manifests_dir" --openshift "$CLUSTER_NAME"
+        fi
     fi
 
     log [INFO] "Cluster manifests preparation complete."
 }
 
-
 update_worker_manifest() {
+    # Count DPU workers from WORKER_* environment variables
+    local worker_count="${WORKER_COUNT:-0}"
+    local dpu_count=0
 
-    local mtu=""
-    if [ "${NODES_MTU}" != "1500" ]; then
-        log "INFO" "Setting ExecStart to include MTU: ${NODES_MTU}"
-        mtu="${NODES_MTU}"
+    for i in $(seq 1 "$worker_count"); do
+        local dpu_var="WORKER_${i}_DPU"
+        local is_dpu="${!dpu_var:-true}"
+        [[ "$is_dpu" == "true" ]] && ((dpu_count++)) || true
+    done
+
+    if [[ $dpu_count -eq 0 ]]; then
+        log "INFO" "No DPU workers configured (WORKER_COUNT=${worker_count}), skipping worker manifest generation"
+        return 0
     fi
-    update_file_multi_replace \
-            "$MANIFESTS_DIR/cluster-installation/99-worker-bridge.yaml" \
-            "$GENERATED_DIR/99-worker-bridge.yaml" \
-            "<NODES_MTU>" "$mtu"
+
+    log "INFO" "Found ${dpu_count} DPU worker(s), generating worker manifests"
+
+    # Detect SNO environment (VM_COUNT=1): use 'worker' role, otherwise 'worker-dpu'
+    local worker_role="worker-dpu"
+    if [[ "${VM_COUNT:-0}" -eq 1 ]]; then
+        worker_role="worker"
+        log "INFO" "SNO environment detected (VM_COUNT=1), using worker role for MachineConfigs"
+    else
+        log "INFO" "Multi-node environment, using worker-dpu role with MachineConfigPool"
+    fi
+
+    # Process worker performance configurations (optional - for manual application by user)
+    mkdir -p "$GENERATED_DIR/worker-perfomance-configurations"
+
+    if [[ -f "$MANIFESTS_DIR/worker-perfomance-configurations/99-worker-perf-kernel-args.yaml" ]]; then
+        log "INFO" "Processing worker performance kernel arguments with role: $worker_role"
+        update_file_multi_replace \
+            "$MANIFESTS_DIR/worker-perfomance-configurations/99-worker-perf-kernel-args.yaml" \
+            "$GENERATED_DIR/worker-perfomance-configurations/99-worker-perf-kernel-args.yaml" \
+            "<WORKER_ROLE>" "$worker_role"
+        log "INFO" "Generated: $GENERATED_DIR/worker-perfomance-configurations/99-worker-perf-kernel-args.yaml (apply manually if needed)"
+    fi
+
+    if [[ -f "$MANIFESTS_DIR/worker-perfomance-configurations/99-kubeletconfig-workers.yaml" ]]; then
+        log "INFO" "Processing worker kubelet config with role: $worker_role"
+        update_file_multi_replace \
+            "$MANIFESTS_DIR/worker-perfomance-configurations/99-kubeletconfig-workers.yaml" \
+            "$GENERATED_DIR/worker-perfomance-configurations/99-kubeletconfig-workers.yaml" \
+            "<WORKER_ROLE>" "$worker_role"
+        log "INFO" "Generated: $GENERATED_DIR/worker-perfomance-configurations/99-kubeletconfig-workers.yaml (apply manually if needed)"
+    fi
 }
 
 function deploy_core_operator_sources() {
     log [INFO] "Deploying NFD and SR-IOV subscriptions..."
     log [INFO] "Using catalog source: ${CATALOG_SOURCE_NAME}"
-    log [INFO] "Using v4.19 workaround: ${USE_V419_WORKAROUND}"
+    log [INFO] "OLM workaround: ${OLM_WORKAROUND}"
 
     mkdir -p "$GENERATED_DIR"
 
-    for f in "$MANIFESTS_DIR/cluster-installation/nfd-subscription.yaml" \
-             "$MANIFESTS_DIR/cluster-installation/sriov-subscription.yaml"; do
-        if [ -f "$f" ]; then
-            cp "$f" "$GENERATED_DIR/"
-            sed -i "s|<CATALOG_SOURCE_NAME>|$CATALOG_SOURCE_NAME|g" "$GENERATED_DIR/$(basename "$f")"
-            apply_manifest "$GENERATED_DIR/$(basename "$f")" true
-        fi
-    done
+    update_file_multi_replace \
+        "$MANIFESTS_DIR/cluster-installation/nfd-subscription.yaml" \
+        "$GENERATED_DIR/nfd-subscription.yaml" \
+        "<CATALOG_SOURCE_NAME>" "$CATALOG_SOURCE_NAME"
+    apply_manifest "$GENERATED_DIR/nfd-subscription.yaml" true
 
-    if [[ "${USE_V419_WORKAROUND}" == "true" ]]; then
-        log [INFO] "Deploying v4.19 catalog source (workaround enabled)"
-        local catalog_file="$MANIFESTS_DIR/cluster-installation/4.19-cataloguesource.yaml"
-        if [ -f "$catalog_file" ]; then
-            apply_manifest "$catalog_file" true
-        fi
+    if [[ "${OLM_WORKAROUND}" == "true" ]]; then
+        log [INFO] "Deploying catalog source for v${OLM_WORKAROUND_VERSION} (OLM workaround enabled)"
+        update_file_multi_replace \
+            "$MANIFESTS_DIR/cluster-installation/olm-catalogsource-template.yaml" \
+            "$GENERATED_DIR/olm-catalogsource.yaml" \
+            "<OLM_VERSION>" "$OLM_WORKAROUND_VERSION"
+        apply_manifest "$GENERATED_DIR/olm-catalogsource.yaml" true
     else
-        log [INFO] "Skipping v4.19 catalog source deployment (using standard OLM)"
+        log [INFO] "Skipping OLM workaround catalog source (using standard OLM)"
     fi
 
     log [INFO] "Core operator sources deployed."
@@ -253,10 +222,6 @@ prepare_dpf_manifests() {
       exit 1
     fi
 
-    if [ -z "$DPU_INTERFACE" ]; then
-      echo "Error: DPU_INTERFACE must be set"
-      exit 1
-    fi
 
     # Create generated directory if it doesn't exist
     if [ ! -d "${GENERATED_DIR}" ]; then
@@ -280,31 +245,16 @@ prepare_dpf_manifests() {
 
     # Copy cert-manager manifest (required for DPF deployment)
     log "INFO" "Copying Cert-Manager manifest (required for DPF operator)..."
-    cp "$MANIFESTS_DIR/cluster-installation/openshift-cert-manager.yaml" "$GENERATED_DIR/"
+    update_file_multi_replace \
+        "$MANIFESTS_DIR/cluster-installation/openshift-cert-manager.yaml" \
+        "$GENERATED_DIR/openshift-cert-manager.yaml" \
+        "<CATALOG_SOURCE_NAME>" "$CATALOG_SOURCE_NAME"
 
-    log "INFO" "DPF manifest preparation completed successfully"
-
-    # Update manifests with configuration
-    # Check if bfb-pvc.yaml exists before modifying
-    if [ ! -f "$GENERATED_DIR/bfb-pvc.yaml" ]; then
-        log "ERROR" "bfb-pvc.yaml not found in $GENERATED_DIR"
-        return 1
-    fi
-    
-    # For single-node clusters (VM_COUNT < 2), we use direct NFS PV binding, so remove storageClassName
-    if [ "${VM_COUNT}" -lt 2 ]; then
-        if ! grep -v 'storageClassName: ""' "$GENERATED_DIR/bfb-pvc.yaml" > "$GENERATED_DIR/bfb-pvc.yaml.tmp"; then
-            log "ERROR" "Failed to process bfb-pvc.yaml for single-node cluster"
-            return 1
-        fi
-        mv "$GENERATED_DIR/bfb-pvc.yaml.tmp" "$GENERATED_DIR/bfb-pvc.yaml"
-    else
-        sed -i "s|storageClassName: \"\"|storageClassName: \"$BFB_STORAGE_CLASS\"|g" "$GENERATED_DIR/bfb-pvc.yaml"
-    fi
-
-    # Update static DPU cluster template
-    sed -i "s|<KUBERNETES_VERSION>|$OPENSHIFT_VERSION|g" "$GENERATED_DIR/static-dpucluster-template.yaml"
-    sed -i "s|<HOSTED_CLUSTER_NAME>|$HOSTED_CLUSTER_NAME|g" "$GENERATED_DIR/static-dpucluster-template.yaml"
+    update_file_multi_replace \
+        "$GENERATED_DIR/static-dpucluster-template.yaml" \
+        "$GENERATED_DIR/static-dpucluster-template.yaml" \
+        "<KUBERNETES_VERSION>" "$OPENSHIFT_VERSION" \
+        "<HOSTED_CLUSTER_NAME>" "$HOSTED_CLUSTER_NAME"
 
     # Extract NGC API key and update secrets
     NGC_API_KEY=$(jq -r '.auths."nvcr.io".password // empty' "$DPF_PULL_SECRET" 2>/dev/null)
@@ -314,7 +264,7 @@ prepare_dpf_manifests() {
     fi
     
     # Process ngc-secrets.yaml using process_template function
-    process_template \
+    update_file_multi_replace \
         "$MANIFESTS_DIR/dpf-installation/ngc-secrets.yaml" \
         "$GENERATED_DIR/ngc-secrets.yaml" \
         "<NGC_API_KEY>" "$NGC_API_KEY"
@@ -327,27 +277,30 @@ prepare_dpf_manifests() {
         return 1
     fi
     local escaped_secret=$(escape_sed_replacement "$PULL_SECRET")
-    sed -i "s|<PULL_SECRET_BASE64>|$escaped_secret|g" "$GENERATED_DIR/dpf-pull-secret.yaml"
+    update_file_multi_replace \
+        "$GENERATED_DIR/dpf-pull-secret.yaml" \
+        "$GENERATED_DIR/dpf-pull-secret.yaml" \
+        "<PULL_SECRET_BASE64>" "$escaped_secret"
 
-    prepare_nfs
-    
-    # Process dpfoperatorconfig.yaml
-    process_template \
+    # For OCP >= 4.22, Hypershift handles node CIDR allocation natively so
+    # the dpu-node-ipam-controller is not deployed.  Instead, tell DPF's
+    # Flannel the cluster CIDR that the provisioner operator configures on
+    # the HostedCluster.
+    local flannel_config=""
+    if ocp_version_gte "${OPENSHIFT_VERSION}" "4.22"; then
+        log "INFO" "OCP ${OPENSHIFT_VERSION} >= 4.22: setting flannel podCIDR to ${FLANNEL_POD_CIDR}"
+        flannel_config="flannel:
+    podCIDR: ${FLANNEL_POD_CIDR}"
+    fi
+
+    update_file_multi_replace \
         "$MANIFESTS_DIR/dpf-installation/dpfoperatorconfig.yaml" \
         "$GENERATED_DIR/dpfoperatorconfig.yaml" \
         "<CLUSTER_NAME>" "$CLUSTER_NAME" \
-        "<BASE_DOMAIN>" "$BASE_DOMAIN"
-    
-    if [ -n "$NODES_MTU" ] && [ "$NODES_MTU" == "9000" ]; then
-        log "INFO" "Appending networking configuration with MTU: $NODES_MTU"
-        cat >> "$GENERATED_DIR/dpfoperatorconfig.yaml" <<-EOF
-  networking:
-    controlPlaneMTU: $NODES_MTU
-    highSpeedMTU: $NODES_MTU
-EOF
-    else
-       log "INFO" "NODES_MTU is not set. Skipping networking configuration."
-    fi
+        "<BASE_DOMAIN>" "$BASE_DOMAIN" \
+        "<SRIOV_DP_RESOURCE_PREFIX>" "$SRIOV_DP_RESOURCE_PREFIX" \
+        "<FLANNEL_CONFIG>" "$flannel_config" \
+        "<NODES_MTU>" "$NODES_MTU"
 
     # Final verification: ensure no Helm values files are in the generated directory
     if find "$GENERATED_DIR" -maxdepth 1 -type f -name "*-values.yaml" | grep -q .; then
@@ -355,6 +308,8 @@ EOF
         find "$GENERATED_DIR" -maxdepth 1 -type f -name "*-values.yaml" -delete
         log "INFO" "Removed Helm values files from generated directory"
     fi
+
+    log "INFO" "DPF manifest preparation completed successfully"
 }
 
 function update_ovn_mtu_in_value_file() {
@@ -424,8 +379,6 @@ function generate_ovn_manifests() {
         -e "s|<TARGETCLUSTER_API_SERVER_PORT>|6443|" \
         -e "s|<POD_CIDR>|$POD_CIDR|" \
         -e "s|<SERVICE_CIDR>|$SERVICE_CIDR|" \
-        -e "s|<DPU_P0_VF1>|${DPU_OVN_VF:-ens7f0v1}|" \
-        -e "s|<DPU_P0>|$DPU_INTERFACE|" \
         -e "s|<OVN_KUBERNETES_IMAGE_REPO>|$OVN_KUBERNETES_IMAGE_REPO|" \
         -e "s|<OVN_KUBERNETES_IMAGE_TAG>|$OVN_KUBERNETES_IMAGE_TAG|" \
         -e "s|<OVN_KUBERNETES_UTILS_IMAGE_REPO>|$OVN_KUBERNETES_UTILS_IMAGE_REPO|" \
@@ -453,25 +406,28 @@ function generate_ovn_manifests() {
 }
 
 function enable_storage() {
-    log [INFO] "Enabling storage operator"
-    
+    log [INFO] "Enabling storage operator (STORAGE_TYPE=${STORAGE_TYPE})"
+
+    # Skip when user provides their own StorageClasses
+    if [ "${SKIP_DEPLOY_STORAGE}" = "true" ]; then
+        log [INFO] "SKIP_DEPLOY_STORAGE=true: not enabling LSO/LVM operator; using existing StorageClasses (ETCD_STORAGE_CLASS=${ETCD_STORAGE_CLASS})"
+        return 0
+    fi
+
     # Check if cluster is already installed
     if check_cluster_installed; then
         log [INFO] "Skipping storage operator configuration as cluster is already installed"
         return 0
     fi
-    
-    # Update cluster with storage operator
-    if [ "$VM_COUNT" -eq 1 ]; then
-        log [INFO] "Enable LVM operator"
-        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lvm"}]'
+
+    if [ "${STORAGE_TYPE}" == "odf" ]; then
+        log [INFO] "Enable LSO operator via assisted installer OLM (ODF will be deployed post-install)"
+        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lso"}]'
+    elif [[ "${OLM_WORKAROUND}" == "true" ]]; then
+        log [INFO] "OLM_WORKAROUND=true: LVM will be deployed at finalizing stage using catalog ${CATALOG_SOURCE_NAME}"
     else
-        if [ "${USE_V419_WORKAROUND}" = "false" ]; then
-            log [INFO] "Enable ODF operator via assisted installer OLM"
-            aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lso"}, {"name": "odf"}]'
-        else
-            log [INFO] "Skipping assisted installer OLM (using v4.19 workaround)"
-        fi
+        log [INFO] "Enable LVM operator via assisted installer OLM"
+        aicli update cluster "$CLUSTER_NAME" -P olm_operators='[{"name": "lvm"}]'
     fi
 }
 
@@ -498,12 +454,9 @@ function main() {
         apply-lso)
             deploy_lso
             ;;
-        prepare-nfs)
-            prepare_nfs
-            ;;
         *)
             log [INFO] "Unknown command: $command"
-            log [INFO] "Available commands: prepare-manifests, prepare-dpf-manifests, apply-lso, deploy-core-operator-sources, generate-ovn-manifests, prepare-nfs"
+            log [INFO] "Available commands: prepare-manifests, prepare-dpf-manifests, apply-lso, deploy-core-operator-sources, generate-ovn-manifests"
             exit 1
             ;;
     esac

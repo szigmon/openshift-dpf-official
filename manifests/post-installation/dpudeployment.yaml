@@ -5,10 +5,16 @@ metadata:
   namespace: dpf-operator-system
 spec:
   dpus:
+    nodeEffect:
+      drain: true
+    dpuSetStrategy:
+      type: RollingUpdate
     bfb: bf-bundle
-    flavor: flavor
+    flavor: hbn-ovnk
     dpuSets:
     - nameSuffix: "dpuset1"
+      dpuAnnotations:
+        noderesources.dpu.nvidia.com/nodesriovdevicepluginconfig: <SRIOV_DP_CONFIG_NAME>
       nodeSelector:
         matchLabels:
           feature.node.kubernetes.io/dpu-enabled: ""

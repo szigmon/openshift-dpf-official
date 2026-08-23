@@ -5,6 +5,14 @@ metadata:
   name: argocd
   namespace: dpf-operator-system
 spec:
+  resourceExclusions: |
+    - apiGroups:
+      - packages.operators.coreos.com
+      kinds:
+      - PackageManifest
+      clusters:
+      - "*"
+
   nodePlacement:
     nodeSelector:
       node-role.kubernetes.io/control-plane: ""
@@ -19,20 +27,6 @@ spec:
   server:
     route:
       enabled: true
-    labels:
-      ovn.dpu.nvidia.com/skip-injection: ""
-
-  controller:
-    labels:
-      ovn.dpu.nvidia.com/skip-injection: ""
-
-  repo:
-    labels:
-      ovn.dpu.nvidia.com/skip-injection: ""
-
-  redis:
-    labels:
-      ovn.dpu.nvidia.com/skip-injection: ""
 
   applicationSet:
     enabled: false

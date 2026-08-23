@@ -58,7 +58,7 @@ function deploy_metallb() {
     fi
     
     
-    log [INFO] "Deploying MetalLB for Hypershift API LoadBalancer: ${HYPERSHIFT_API_IP}..."
+    log [INFO] "Deploying MetalLB operator for Hypershift API LoadBalancer..."
     
     get_kubeconfig
     
@@ -82,20 +82,19 @@ function deploy_metallb() {
     log [INFO] "Waiting for MetalLB operator to be ready..."
     wait_for_pods "openshift-operators" "control-plane=controller-manager" 60 5
     
-    log [INFO] "Creating MetalLB instance and IP address pool..."
-    
-    # Process MetalLB objects template
+    log [INFO] "Creating MetalLB instance..."
+
+    # Process MetalLB CR template (only the MetalLB instance, not IPAddressPool/L2Advertisement)
+    # Note: IPAddressPool and L2Advertisement are now managed by dpf-hcp-provisioner-operator
     process_template \
         "${MANIFESTS_DIR}/metallb/metallb-objects.yaml" \
-        "${GENERATED_DIR}/metallb-objects.yaml" \
-        "<HYPERSHIFT_API_IP>" "${HYPERSHIFT_API_IP}" \
-        "<HOSTED_CONTROL_PLANE_NAMESPACE>" "${HOSTED_CONTROL_PLANE_NAMESPACE}"
+        "${GENERATED_DIR}/metallb-objects.yaml"
     
-    # Apply MetalLB objects
+    # Apply MetalLB CR
     retry 5 10 apply_manifest "${GENERATED_DIR}/metallb-objects.yaml" true
             
-    log [INFO] "MetalLB deployment completed successfully!"
-    log [INFO] "Hypershift API LoadBalancer will use IP: ${HYPERSHIFT_API_IP}"
+    log [INFO] "MetalLB operator deployment completed successfully!"
+    log [INFO] "Note: IPAddressPool and L2Advertisement will be managed by dpf-hcp-provisioner-operator"
 }
 
 function apply_scc() {
@@ -162,91 +161,229 @@ function deploy_cert_manager() {
     fi
 }
 
+function deploy_dpf_hcp_provisioner_operator() {
+    log [INFO] "Deploying DPF HCP Provisioner Operator..."
+
+    # Ensure helm is installed
+    ensure_helm_installed
+
+    log [INFO] "Installing/upgrading DPF HCP Provisioner Operator..."
+
+    local version_flag=""
+    if [[ -n "${DPF_HCP_PROVISIONER_OPERATOR_VERSION}" ]]; then
+        version_flag="--version ${DPF_HCP_PROVISIONER_OPERATOR_VERSION}"
+    fi
+
+    if helm upgrade --install dpf-hcp-provisioner-operator \
+        "${DPF_HCP_PROVISIONER_OPERATOR_CHART_URL}" \
+        --namespace ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE} \
+        --create-namespace \
+        --disable-openapi-validation \
+        ${version_flag} \
+        --set image.repository=${DPF_HCP_PROVISIONER_OPERATOR_IMAGE_REPO} \
+        --set image.pullPolicy=Always \
+        --set image.tag=${DPF_HCP_PROVISIONER_OPERATOR_IMAGE_TAG} \
+        --set provisionerConfig.manageDPUServiceTemplates=true; then
+
+        log [INFO] "Helm release 'dpf-hcp-provisioner-operator' deployed successfully"
+        log [INFO] "DPF HCP Provisioner Operator deployment initiated. Use 'oc get pods -n ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}' to monitor progress."
+    else
+        log [ERROR] "Helm deployment of DPF HCP Provisioner Operator failed"
+        return 1
+    fi
+
+    log [INFO] "Waiting for DPF HCP Provisioner Operator to be ready..."
+    wait_for_pods "${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}" "app.kubernetes.io/name=dpf-hcp-provisioner-operator" 60 10
+
+    log [INFO] "DPF HCP Provisioner Operator is ready!"
+}
+
+function deploy_dpu_worker_config() {
+    log [INFO] "Deploying DPU Worker Config chart..."
+
+    ensure_helm_installed
+
+    local version_flag=""
+    if [[ -n "${DPU_WORKER_CONFIG_CHART_VERSION}" ]]; then
+        version_flag="--version ${DPU_WORKER_CONFIG_CHART_VERSION}"
+    fi
+
+    local mtu_flag=""
+    if [[ -n "${NODES_MTU}" && "${NODES_MTU}" != "1500" ]]; then
+        mtu_flag="--set networkMTU=${NODES_MTU}"
+    fi
+
+    if helm upgrade --install dpu-worker-config \
+        "${DPU_WORKER_CONFIG_CHART_URL}" \
+        --namespace ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE} \
+        --create-namespace \
+        --disable-openapi-validation \
+        ${version_flag} \
+        ${mtu_flag}; then
+        log [INFO] "Helm release 'dpu-worker-config' deployed successfully"
+    else
+        log [ERROR] "Helm deployment of dpu-worker-config failed"
+        return 1
+    fi
+}
+
+function create_dpfhcpprovisioner_secrets() {
+    log [INFO] "Creating secrets in ${CLUSTERS_NAMESPACE} namespace..."
+
+    # Create namespace if it doesn't exist
+    oc create namespace ${CLUSTERS_NAMESPACE} || true
+
+    # Create pull-secret
+    log [INFO] "Creating pull secret ${DPFHCPPROVISIONER_PULL_SECRET_NAME}..."
+    oc create secret generic ${DPFHCPPROVISIONER_PULL_SECRET_NAME} \
+        --from-file=.dockerconfigjson=${OPENSHIFT_PULL_SECRET} \
+        -n ${CLUSTERS_NAMESPACE} \
+        --type=Opaque || true
+
+    # Create SSH key secret
+    log [INFO] "Creating SSH key secret ${DPFHCPPROVISIONER_SSH_SECRET_NAME}..."
+    oc create secret generic ${DPFHCPPROVISIONER_SSH_SECRET_NAME} \
+        --from-file=id_rsa.pub=${SSH_KEY} \
+        -n ${CLUSTERS_NAMESPACE} \
+        --type=Opaque || true
+
+    log [INFO] "Secrets created successfully in ${CLUSTERS_NAMESPACE} namespace"
+}
+
+function create_dpfhcpprovisioner_cr() {
+    log [INFO] "Creating DPFHCPProvisioner Custom Resource..."
+
+    # Ensure generated directory exists
+    mkdir -p "${GENERATED_DIR}"
+
+    # Ensure namespace exists
+    oc create namespace ${CLUSTERS_NAMESPACE} || true
+
+    # Check if DPFHCPProvisioner CR already exists
+    if oc get dpfhcpprovisioner -n ${CLUSTERS_NAMESPACE} ${HOSTED_CLUSTER_NAME} &>/dev/null; then
+        log [INFO] "DPFHCPProvisioner CR ${HOSTED_CLUSTER_NAME} already exists. Skipping creation."
+        return 0
+    fi
+
+    # Determine control plane availability policy based on VM_COUNT
+    local control_plane_policy
+    if [ "${VM_COUNT}" -gt 1 ]; then
+        control_plane_policy="HighlyAvailable"
+        log [INFO] "Multi-node cluster (VM_COUNT=${VM_COUNT}). Using HighlyAvailable control plane policy."
+    else
+        control_plane_policy="SingleReplica"
+        log [INFO] "Single-node cluster (VM_COUNT=${VM_COUNT}). Using SingleReplica control plane policy."
+    fi
+
+    # Process template to generate DPFHCPProvisioner CR
+    local cr_file="${GENERATED_DIR}/dpfhcpprovisioner-${HOSTED_CLUSTER_NAME}.yaml"
+
+    process_template \
+        "${MANIFESTS_DIR}/dpf-hcp-provisioner-operator/dpfhcpprovisioner-cr-template.yaml" \
+        "${cr_file}" \
+        "<HOSTED_CLUSTER_NAME>" "${HOSTED_CLUSTER_NAME}" \
+        "<CLUSTERS_NAMESPACE>" "${CLUSTERS_NAMESPACE}" \
+        "<BASE_DOMAIN>" "${BASE_DOMAIN}" \
+        "<ETCD_STORAGE_CLASS>" "${ETCD_STORAGE_CLASS}" \
+        "<OCP_RELEASE_IMAGE>" "${OCP_RELEASE_IMAGE}" \
+        "<DPFHCPPROVISIONER_PULL_SECRET_NAME>" "${DPFHCPPROVISIONER_PULL_SECRET_NAME}" \
+        "<DPFHCPPROVISIONER_SSH_SECRET_NAME>" "${DPFHCPPROVISIONER_SSH_SECRET_NAME}" \
+        "<CONTROL_PLANE_POLICY>" "${control_plane_policy}" \
+        "<BLUEFIELD_OCP_IMAGE>" "${BLUEFIELD_OCP_IMAGE}"
+
+    # Add virtualIP if HYPERSHIFT_API_IP is set
+    if [ -n "${HYPERSHIFT_API_IP}" ]; then
+        cat >> "${cr_file}" << EOF
+
+  # Virtual IP for LoadBalancer
+  virtualIP: ${HYPERSHIFT_API_IP}
+EOF
+        log [INFO] "Added virtualIP: ${HYPERSHIFT_API_IP} to DPFHCPProvisioner CR"
+    fi
+
+    # Apply the DPFHCPProvisioner CR using apply_manifest
+    log [INFO] "Applying DPFHCPProvisioner CR from ${cr_file}..."
+    apply_manifest "${cr_file}" true
+
+    log [INFO] "DPFHCPProvisioner CR ${HOSTED_CLUSTER_NAME} created successfully!"
+    log [INFO] "Monitoring DPFHCPProvisioner status..."
+
+    # Show initial status
+    oc get dpfhcpprovisioner -n ${CLUSTERS_NAMESPACE} ${HOSTED_CLUSTER_NAME} || true
+}
+
 function deploy_hosted_cluster() {
     deploy_hypershift
 }
 
 function deploy_hypershift() {
-    if [ "${ENABLE_HCP_MULTUS}" = "true" ]; then
-        log [INFO] "HCP Multus enabled mode is active. Using custom hypershift image: ${HYPERSHIFT_IMAGE}"
-    fi
-    
-    # Check if Hypershift operator is already installed
-    if oc get deployment -n hypershift hypershift-operator &>/dev/null; then
+    log [INFO] "================================================================================"
+    log [INFO] "Deploying Hosted Cluster using DPF HCP Provisioner Operator"
+    log [INFO] "================================================================================"
+
+    # Step 1: Deploy DPU Worker Config chart (MachineConfig for DPU worker nodes)
+    deploy_dpu_worker_config
+
+    # Step 2: Deploy DPF HCP Provisioner Operator
+    deploy_dpf_hcp_provisioner_operator
+
+    # Step 3: Install Hypershift operator (required by dpf-hcp-provisioner-operator)
+    if oc get deployment -n hypershift operator &>/dev/null; then
         log [INFO] "Hypershift operator already installed. Skipping deployment."
     else
         log [INFO] "Installing latest hypershift operator"
         install_hypershift
+        wait_for_pods "hypershift" "app=operator" 30 5
     fi
 
-    # Deploy MetalLB if HYPERSHIFT_API_IP is configured (multi-node clusters only)
+    # Step 4: Deploy MetalLB operator if HYPERSHIFT_API_IP is configured (multi-node clusters only)
     if [ -n "${HYPERSHIFT_API_IP}" ]; then
-        log [INFO] "HYPERSHIFT_API_IP configured. Deploying MetalLB for LoadBalancer support..."
+        log [INFO] "HYPERSHIFT_API_IP configured. Deploying MetalLB operator for LoadBalancer support..."
         deploy_metallb
     elif [ "${VM_COUNT}" -gt 1 ]; then
         log [WARN] "Multi-node cluster detected but HYPERSHIFT_API_IP not set."
         log [WARN] "Hypershift API will use NodePort instead of LoadBalancer."
     fi
 
-    log [INFO] "Checking if Hypershift hosted cluster ${HOSTED_CLUSTER_NAME} already exists..."
-    if oc get hostedcluster -n ${CLUSTERS_NAMESPACE} ${HOSTED_CLUSTER_NAME} &>/dev/null; then
-        log [INFO] "Hypershift hosted cluster ${HOSTED_CLUSTER_NAME} already exists. Skipping creation."
-    else
-        wait_for_pods "hypershift" "app=operator" 30 5
-        log [INFO] "Creating Hypershift hosted cluster ${HOSTED_CLUSTER_NAME}..."
-        oc create ns "${HOSTED_CONTROL_PLANE_NAMESPACE}" || true
-        
-        # Build hypershift command with conditional flags
-        local hypershift_args=(
-            "create" "cluster" "none"
-            "--name=${HOSTED_CLUSTER_NAME}"
-            "--base-domain=${BASE_DOMAIN}"
-            "--release-image=${OCP_RELEASE_IMAGE}"
-            "--ssh-key=${SSH_KEY}"
-            "--pull-secret=${OPENSHIFT_PULL_SECRET}"
-            "--disable-cluster-capabilities=ImageRegistry,Insights,Console,openshift-samples,Ingress,NodeTuning"
-            "--network-type=Other"
-            "--etcd-storage-class=${ETCD_STORAGE_CLASS}"
-            "--node-selector=node-role.kubernetes.io/master=\"\""
-            "--node-pool-replicas=0"
-            "--node-upgrade-type=Replace"
-        )
+    # Step 5: Create secrets in clusters namespace
+    create_dpfhcpprovisioner_secrets
 
-        # Set availability policies based on VM_COUNT only
-        if [ "${VM_COUNT}" -gt 1 ]; then
-            hypershift_args+=("--control-plane-availability-policy=HighlyAvailable")
-            hypershift_args+=("--infra-availability-policy=HighlyAvailable")
-            log [INFO] "Multi-node cluster (VM_COUNT=${VM_COUNT}). Using HighlyAvailable policies."
-        else
-            hypershift_args+=("--control-plane-availability-policy=SingleReplica")
-            hypershift_args+=("--infra-availability-policy=SingleReplica")
-            log [INFO] "Single-node cluster (VM_COUNT=${VM_COUNT}). Using SingleReplica policies."
-        fi
+    # Step 6: Create DPFHCPProvisioner Custom Resource
+    create_dpfhcpprovisioner_cr
 
-        if [ "${ENABLE_HCP_MULTUS}" != "true" ]; then
-            hypershift_args+=("--disable-multi-network")
-        fi
-
-        # HYPERSHIFT_API_IP controls LoadBalancer usage, independent of cluster type
-        if [ -n "${HYPERSHIFT_API_IP}" ]; then
-            hypershift_args+=("--expose-through-load-balancer")
-            log [INFO] "Using LoadBalancer with IP: ${HYPERSHIFT_API_IP}"
-        fi        
-        log [INFO] "Creating hosted cluster with HCP multus enabled ${ENABLE_HCP_MULTUS}..."
-        hypershift "${hypershift_args[@]}"
+    # Step 7: Wait for HostedCluster to be created by the operator
+    # The operator creates HostedCluster in the same namespace as DPFHCPProvisioner CR
+    log [INFO] "Waiting for DPF HCP Provisioner Operator to create HostedCluster..."
+    if ! retry 5 30 oc get hostedcluster -n ${CLUSTERS_NAMESPACE} ${HOSTED_CLUSTER_NAME} &>/dev/null; then
+        log [ERROR] "Timeout: HostedCluster was not created after 2.5 minutes"
+        log [ERROR] "Check DPFHCPProvisioner CR status:"
+        oc get dpfhcpprovisioner -n ${CLUSTERS_NAMESPACE} ${HOSTED_CLUSTER_NAME} -o yaml
+        return 1
     fi
 
+    log [INFO] "HostedCluster ${HOSTED_CLUSTER_NAME} created by operator in ${CLUSTERS_NAMESPACE}"
+
+    # Apply CNO image override if configured
     if [ -n "${CNO_HCP_IMAGE}" ]; then
         add_cno_image_override
     fi
 
+    # Step 8: Wait for hosted control plane namespace and pods
+    log [INFO] "Waiting for hosted control plane namespace ${HOSTED_CONTROL_PLANE_NAMESPACE}..."
+    retry 30 10 bash -c "oc get namespace ${HOSTED_CONTROL_PLANE_NAMESPACE} &>/dev/null"
+
     log [INFO] "Checking hosted control plane pods..."
-    oc -n ${HOSTED_CONTROL_PLANE_NAMESPACE} get pods
+    oc -n ${HOSTED_CONTROL_PLANE_NAMESPACE} get pods || true
+
     log [INFO] "Waiting for etcd pods..."
     wait_for_pods ${HOSTED_CONTROL_PLANE_NAMESPACE} "app=etcd" 60 10
-    
+
+    # Step 9: Configure hypershift (create kubeconfig and copy to dpf-operator-system)
     configure_hypershift
-    create_ignition_template
+
+    log [INFO] "================================================================================"
+    log [INFO] "Hosted Cluster deployment via DPF HCP Provisioner Operator completed!"
+    log [INFO] "================================================================================"
 }
 
 function add_cno_image_override() {
@@ -271,66 +408,31 @@ function add_cno_image_override() {
     done
 }
 
-function create_ignition_template() {
-    log [INFO] "Creating ignition template..."
-    retry 10 40 "$(dirname "${BASH_SOURCE[0]}")/gen_template.py" -f "${GENERATED_DIR}/hcp_template.yaml" -c "${HOSTED_CLUSTER_NAME}" -hc "${CLUSTERS_NAMESPACE}"
-    log [INFO] "Ignition template created"
-    oc apply -f "$GENERATED_DIR/hcp_template.yaml"
-}
-
 function configure_hypershift() {
     log [INFO] "Creating kubeconfig for Hypershift hosted cluster..."
 
-    if oc get secret -n dpf-operator-system "${HOSTED_CLUSTER_NAME}-admin-kubeconfig" &>/dev/null; then
-        log [INFO] "Secret ${HOSTED_CLUSTER_NAME}-admin-kubeconfig already exists. Skipping creation."
-    else
-      # Wait for the HostedCluster resource to create the admin-kubeconfig secret with valid data
-          wait_for_secret_with_data "${CLUSTERS_NAMESPACE}" "${HOSTED_CLUSTER_NAME}-admin-kubeconfig" "kubeconfig" 60 10
+    # Wait for the HostedCluster resource to create the admin-kubeconfig secret with valid data
+    wait_for_secret_with_data "${CLUSTERS_NAMESPACE}" "${HOSTED_CLUSTER_NAME}-admin-kubeconfig" "kubeconfig" 60 10
 
-          # Then create the kubeconfig with retries
-          log [INFO] "Generating kubeconfig file for ${HOSTED_CLUSTER_NAME}..."
-          local max_attempts=5
-          local delay=10
-          # Use retry to generate a valid kubeconfig file
-          retry "$max_attempts" "$delay" bash -c '
-              ns="$1"; name="$2"
-              hypershift create kubeconfig --namespace "$ns" --name "$name" > "$name.kubeconfig" && \
-              grep -q "apiVersion: v1" "$name.kubeconfig" && \
-              grep -q "kind: Config" "$name.kubeconfig"
-          ' _ "${CLUSTERS_NAMESPACE}" "${HOSTED_CLUSTER_NAME}"
+    # Create ${HOSTED_CLUSTER_NAME}.kubeconfig file for use by post-install scripts
+    log [INFO] "Generating kubeconfig file for ${HOSTED_CLUSTER_NAME}..."
+    local max_attempts=5
+    local delay=10
+    # Use retry to generate a valid kubeconfig file
+    retry "$max_attempts" "$delay" bash -c '
+        ns="$1"; name="$2"
+        hypershift create kubeconfig --namespace "$ns" --name "$name" > "$name.kubeconfig" && \
+        grep -q "apiVersion: v1" "$name.kubeconfig" && \
+        grep -q "kind: Config" "$name.kubeconfig"
+    ' _ "${CLUSTERS_NAMESPACE}" "${HOSTED_CLUSTER_NAME}"
 
-    fi
-
-    copy_hypershift_kubeconfig
-}
-
-function copy_hypershift_kubeconfig() {
-    log [INFO] "Copying hypershift kubeconfig..."
-    
-    # Extract kubeconfig from secret
-    if ! oc get secret -n "${CLUSTERS_NAMESPACE}" "${HOSTED_CLUSTER_NAME}-admin-kubeconfig" -o jsonpath='{.data.kubeconfig}' | base64 -d > ${HOSTED_CLUSTER_NAME}.kubeconfig; then
-        log [ERROR] "Failed to extract kubeconfig from secret"
+    # Wait for the dpf-hcp-provisioner-operator to copy the secret to dpf-operator-system namespace
+    log [INFO] "Waiting for dpf-hcp-provisioner-operator to create kubeconfig secret in dpf-operator-system..."
+    if ! retry 30 10 oc get secret -n dpf-operator-system "${HOSTED_CLUSTER_NAME}-admin-kubeconfig" &>/dev/null; then
+        log [ERROR] "Timeout: dpf-hcp-provisioner-operator did not create kubeconfig secret in dpf-operator-system after 5 minutes"
         return 1
     fi
-    
-    # Verify kubeconfig is not empty
-    if [ ! -s "${HOSTED_CLUSTER_NAME}.kubeconfig" ]; then
-        log [ERROR] "Extracted kubeconfig is empty"
-        return 1
-    fi
-    
-    # Create or update secret in dpf-operator-system namespace
-    if ! oc create secret generic ${HOSTED_CLUSTER_NAME}-admin-kubeconfig -n dpf-operator-system \
-         --from-file=super-admin.conf=./${HOSTED_CLUSTER_NAME}.kubeconfig --type=Opaque 2>/dev/null; then
-        log [INFO] "Secret already exists, updating..."
-        if ! oc -n dpf-operator-system create secret generic ${HOSTED_CLUSTER_NAME}-admin-kubeconfig \
-             --from-file=super-admin.conf=./${HOSTED_CLUSTER_NAME}.kubeconfig --type=Opaque --dry-run=client -o yaml | oc apply -f -; then
-            log [ERROR] "Failed to update kubeconfig secret"
-            return 1
-        fi
-    fi
-    
-    log [INFO] "Hypershift kubeconfig copied successfully"
+    log [INFO] "Kubeconfig secret successfully created by dpf-hcp-provisioner-operator in dpf-operator-system"
 }
 
 function apply_remaining() {
@@ -409,6 +511,7 @@ function deploy_maintenance_operator() {
     helm upgrade --install maintenance-operator oci://ghcr.io/mellanox/maintenance-operator-chart \
         --namespace dpf-operator-system \
         --create-namespace \
+        --disable-openapi-validation \
         --version ${MAINTENANCE_OPERATOR_VERSION} \
         --values "${HELM_CHARTS_DIR}/maintenance-operator-values.yaml" \
         --wait
@@ -433,12 +536,8 @@ function apply_dpf() {
     fi
     log "INFO" "Cluster is accessible, proceeding with DPF deployment..."
     
-    # Deploy ArgoCD and Maintenance Operator for DPF v25.7+
-    if [[ "$DPF_VERSION" =~ ^v25\.[7-9] ]] || [[ "$DPF_VERSION" =~ ^v2[6-9] ]]; then
-        log [INFO] "DPF version $DPF_VERSION requires ArgoCD and Maintenance Operator"
-        deploy_argocd
-        deploy_maintenance_operator
-    fi
+    deploy_argocd
+    deploy_maintenance_operator
 
     log "INFO" "Enabling IP forwarding for OVN Kubernetes..."
     oc patch network.operator.openshift.io cluster --type=merge -p \
@@ -511,6 +610,7 @@ function apply_dpf() {
         ${HELM_ARGS} \
         --namespace dpf-operator-system \
         --create-namespace \
+        --disable-openapi-validation \
         --values "${HELM_CHARTS_DIR}/dpf-operator-values.yaml"; then
         
         log "INFO" "Helm release 'dpf-operator' deployed successfully"
@@ -527,6 +627,81 @@ function apply_dpf() {
     wait_for_pods "dpf-operator-system" "dpu.nvidia.com/component=dpf-operator-controller-manager" 30 5
 
     log [INFO] "DPF deployment complete"
+}
+
+function delete_dpf_hcp_provisioner_operator() {
+    # Remove DPF HCP Provisioner Operator and all related resources
+    log "INFO" "Removing DPF HCP Provisioner Operator..."
+
+    get_kubeconfig
+
+    # Ensure helm is installed
+    ensure_helm_installed
+
+    # Delete DPFHCPProvisioner CR instances (if any exist)
+    log "INFO" "Deleting DPFHCPProvisioner custom resources..."
+    if oc get dpfhcpprovisioner -n "${CLUSTERS_NAMESPACE}" &>/dev/null 2>&1; then
+        if ! oc delete dpfhcpprovisioner --all -n "${CLUSTERS_NAMESPACE}" --ignore-not-found --timeout=600s; then
+            log "ERROR" "Failed to delete DPFHCPProvisioner CRs. Exiting..."
+            return 1
+        fi
+    else
+        log "INFO" "No DPFHCPProvisioner CRs found in ${CLUSTERS_NAMESPACE}"
+    fi
+
+    # Delete DPFHCPProvisionerConfig CR (after provisioner CRs, before CRD)
+    log "INFO" "Deleting DPFHCPProvisionerConfig CR..."
+    if oc get dpfhcpprovisionerconfig default &>/dev/null 2>&1; then
+        if ! oc delete dpfhcpprovisionerconfig default --ignore-not-found --timeout=60s; then
+            log "ERROR" "Failed to delete DPFHCPProvisionerConfig CR. Exiting..."
+            return 1
+        fi
+    else
+        log "INFO" "No DPFHCPProvisionerConfig CR found"
+    fi
+
+    # Delete secrets created for DPFHCPProvisioner in clusters namespace
+    log "INFO" "Deleting DPFHCPProvisioner secrets from ${CLUSTERS_NAMESPACE}..."
+    oc delete secret -n "${CLUSTERS_NAMESPACE}" "${DPFHCPPROVISIONER_PULL_SECRET_NAME}" --ignore-not-found || {
+        log "WARN" "Failed to delete secret ${DPFHCPPROVISIONER_PULL_SECRET_NAME} - it may not exist or there may be permission issues"
+    }
+    oc delete secret -n "${CLUSTERS_NAMESPACE}" "${DPFHCPPROVISIONER_SSH_SECRET_NAME}" --ignore-not-found || {
+        log "WARN" "Failed to delete secret ${DPFHCPPROVISIONER_SSH_SECRET_NAME} - it may not exist or there may be permission issues"
+    }
+
+    # Uninstall helm release
+    log "INFO" "Uninstalling DPF HCP Provisioner Operator helm release..."
+    if helm list -n "${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}" | grep -q "^dpf-hcp-provisioner-operator[[:space:]]"; then
+        helm uninstall dpf-hcp-provisioner-operator -n "${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}" --wait || {
+            log "WARN" "Failed to uninstall helm release dpf-hcp-provisioner-operator"
+        }
+        log "INFO" "Helm release uninstalled successfully"
+    else
+        log "INFO" "Helm release dpf-hcp-provisioner-operator not found"
+    fi
+
+    # Delete the CRDs
+    log "INFO" "Deleting DPFHCPProvisionerConfig CRD..."
+    oc delete crd dpfhcpprovisionerconfigs.provisioning.dpu.hcp.io --ignore-not-found --timeout=600s || {
+        log "WARN" "Failed to delete DPFHCPProvisionerConfig CRD, it may have finalizers or dependent resources"
+    }
+    log "INFO" "Deleting DPFHCPProvisioner CRD..."
+    oc delete crd dpfhcpprovisioners.provisioning.dpu.hcp.io --ignore-not-found --timeout=600s || {
+        log "WARN" "Failed to delete DPFHCPProvisioner CRD, it may have finalizers or dependent resources"
+    }
+
+    # Delete the operator namespace (helm uninstall does not delete namespaces)
+    log "INFO" "Deleting DPF HCP Provisioner Operator namespace ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}..."
+    if oc get namespace "${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}" &>/dev/null 2>&1; then
+        oc delete namespace "${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}" --ignore-not-found --timeout=180s || {
+            log "WARN" "Failed to delete namespace ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE}, it may have finalizers or remaining resources"
+        }
+    else
+        log "INFO" "Namespace ${DPF_HCP_PROVISIONER_OPERATOR_NAMESPACE} not found"
+    fi
+
+    log "INFO" "DPF HCP Provisioner Operator removal complete"
+    log "INFO" "Note: The ${CLUSTERS_NAMESPACE} namespace was not deleted as it may contain other resources"
 }
 
 # -----------------------------------------------------------------------------
@@ -556,15 +731,21 @@ function main() {
             deploy-hypershift)
                 deploy_hypershift
                 ;;
-            create-ignition-template)
-                create_ignition_template
+            deploy-dpf-hcp-provisioner-operator)
+                deploy_dpf_hcp_provisioner_operator
                 ;;
-            copy_hypershift_kubeconfig)
-                copy_hypershift_kubeconfig
+            delete-dpf-hcp-provisioner-operator)
+                delete_dpf_hcp_provisioner_operator
+                ;;
+            create-dpfhcpprovisioner-secrets)
+                create_dpfhcpprovisioner_secrets
+                ;;
+            create-dpfhcpprovisioner-cr)
+                create_dpfhcpprovisioner_cr
                 ;;
             *)
                 log [INFO] "Unknown command: $command"
-                log [INFO] "Available commands: deploy-nfd, deploy-metallb, deploy-argocd, deploy-maintenance-operator, apply-dpf, deploy-hypershift"
+                log [INFO] "Available commands: deploy-nfd, deploy-metallb, deploy-argocd, deploy-maintenance-operator, apply-dpf, deploy-hypershift, deploy-dpf-hcp-provisioner-operator, delete-dpf-hcp-provisioner-operator, create-dpfhcpprovisioner-secrets, create-dpfhcpprovisioner-cr"
                 exit 1
                 ;;
         esac

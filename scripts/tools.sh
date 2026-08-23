@@ -30,17 +30,53 @@ function install_helm() {
     log "INFO" "Helm installation complete. Installed version: $(helm version --short)"
 }
 
+function extract_hypershift_binary() {
+    CONTAINER_COMMAND=${CONTAINER_COMMAND:-podman}
+    "$CONTAINER_COMMAND" cp "$("$CONTAINER_COMMAND" create --name hypershift --rm --pull always "$HYPERSHIFT_IMAGE"):/usr/bin/hypershift" /tmp/hypershift 2>&1
+    local rc=$?
+    "$CONTAINER_COMMAND" rm -f hypershift 2>/dev/null || true
+    return $rc
+}
+
+function build_hypershift_from_source() {
+    HYPERSHIFT_REPO=${HYPERSHIFT_REPO:-https://github.com/openshift/hypershift.git}
+
+    if ! command -v go &>/dev/null; then
+        log "ERROR" "Go toolchain not found. Install Go >= 1.22 and retry."
+        return 1
+    fi
+
+    local build_dir
+    build_dir=$(mktemp -d)
+    trap "rm -rf $build_dir" RETURN
+    git clone --depth 1 "$HYPERSHIFT_REPO" "$build_dir"
+    pushd "$build_dir" > /dev/null
+    go build -o /tmp/hypershift .
+    popd > /dev/null
+    log "INFO" "Built hypershift binary from source for $(uname -m)."
+}
+
 function install_hypershift() {
     log "INFO" "Installing Hypershift binary and operator..."
 
-    # Create a temporary container and copy the hypershift binary
-    CONTAINER_COMMAND=${CONTAINER_COMMAND:-podman}
-    $CONTAINER_COMMAND cp $($CONTAINER_COMMAND create --name hypershift --rm --pull always $HYPERSHIFT_IMAGE):/usr/bin/hypershift /tmp/hypershift
-    $CONTAINER_COMMAND rm -f hypershift
+    if [[ "$(uname -m)" == "x86_64" ]]; then
+        if ! extract_hypershift_binary; then
+            log "ERROR" "Failed to extract hypershift binary from container image"
+            return 1
+        fi
+        log "INFO" "Extracted hypershift binary from container image."
+    else
+        log "INFO" "Non-x86 host ($(uname -m)), building hypershift from source..."
+        if ! build_hypershift_from_source; then
+            log "ERROR" "Failed to build hypershift from source"
+            return 1
+        fi
+    fi
 
-    # Install the hypershift binary
-    sudo install -m 0755 -o root -g root /tmp/hypershift /usr/local/bin/hypershift
+    mkdir -p "$HOME/.local/bin"
+    install -m 0755 /tmp/hypershift "$HOME/.local/bin/hypershift"
     rm -f /tmp/hypershift
+    log "INFO" "Installed hypershift binary to $HOME/.local/bin/hypershift"
 
     # Install the Hypershift operator
     KUBECONFIG=$KUBECONFIG hypershift install --hypershift-image $HYPERSHIFT_IMAGE

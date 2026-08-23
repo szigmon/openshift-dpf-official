@@ -19,44 +19,56 @@ get_kubeconfig
 # Ensure helm is installed
 ensure_helm_installed
 
+INJECTOR_WEBHOOK_PORT=19443
+INJECTOR_HEALTH_PROBE_PORT=18081
+INJECTOR_METRICS_PORT=29091
+
 log [INFO] "Enabling OVN resource injector..."
 
-rm -rf "$GENERATED_DIR/ovn-injector" | true
+rm -rf "$GENERATED_DIR/ovn-injector" || true
 mkdir -p "$GENERATED_DIR/ovn-injector"
 
-INJECTOR_RESOURCE_NAME="${INJECTOR_RESOURCE_NAME:-openshift.io/bf3-p0-vfs}"
 
 helm pull "${OVN_CHART_URL}/ovn-kubernetes-chart" \
     --version "${INJECTOR_CHART_VERSION}" \
     --untar -d "$GENERATED_DIR/ovn-injector"
 
-injector_image_params=()
-if [ -n "${INJECTOR_IMAGE:-}" ]; then
-    injector_image_params=(
-        --set "ovn-kubernetes-resource-injector.controllerManager.webhook.image.repository=${INJECTOR_IMAGE%:*}"
-        --set "ovn-kubernetes-resource-injector.controllerManager.webhook.image.tag=${INJECTOR_IMAGE#*:}"
-    )
-fi
-
-helm template -n ${OVNK_NAMESPACE} ovn-kubernetes-resource-injector \
+helm template -n ${OVNK_NAMESPACE} ovn-kubernetes \
     "$GENERATED_DIR/ovn-injector/ovn-kubernetes-chart" \
     --set ovn-kubernetes-resource-injector.enabled=true \
     --set ovn-kubernetes-resource-injector.resourceName="${INJECTOR_RESOURCE_NAME}" \
-    --set ovn-kubernetes-resource-injector.nadName=dpf-ovn-kubernetes \
-    "${injector_image_params[@]}" \
+    --set ovn-kubernetes-resource-injector.prioritizeOffloading=false \
+    --set ovn-kubernetes-resource-injector.controllerManager.hostNetwork=true \
+    --set ovn-kubernetes-resource-injector.controllerManager.webhookPort="${INJECTOR_WEBHOOK_PORT}" \
+    --set ovn-kubernetes-resource-injector.controllerManager.healthProbeBindAddress=":${INJECTOR_HEALTH_PROBE_PORT}" \
+    --set ovn-kubernetes-resource-injector.controllerManager.webhook.image.pullPolicy=IfNotPresent \
+    --set "ovn-kubernetes-resource-injector.controllerManager.webhook.args={--leader-elect,--metrics-bind-address=:${INJECTOR_METRICS_PORT}}" \
     --set nodeWithDPUManifests.enabled=false \
     --set nodeWithoutDPUManifests.enabled=false \
     --set dpuManifests.enabled=false \
     --set controlPlaneManifests.enabled=false \
-    --set commonManifests.enabled=false \
-    | oc apply -f -
+    --set commonManifests.enabled=false > "$GENERATED_DIR/ovn-injector-output.yaml"
+
+oc apply -f "$GENERATED_DIR/ovn-injector-output.yaml"
 
 rm -rf "$GENERATED_DIR/ovn-injector"
 
+# Wait for the webhook deployment to roll out
+log [INFO] "Waiting for OVN resource injector deployment to roll out..."
+if ! oc rollout status deployment/ovn-kubernetes-ovn-kubernetes-resource-injector -n "${OVNK_NAMESPACE}" --timeout=120s; then
+    log [ERROR] "OVN resource injector deployment failed to roll out"
+    exit 1
+fi
+log [INFO] "OVN resource injector deployment rolled out successfully"
 
-# Wait for injector to be ready
-log [INFO] "Waiting for OVN injector deployment to be ready..."
-wait_for_pods "${OVNK_NAMESPACE}" "app.kubernetes.io/name=ovn-kubernetes-resource-injector" 30 10
+# Verify MutatingWebhookConfiguration creation
+log [INFO] "Verifying OVN injector MutatingWebhookConfiguration creation..."
+if oc get mutatingwebhookconfiguration ovn-kubernetes-ovn-kubernetes-resource-injector &>/dev/null; then
+    log [INFO] "MutatingWebhookConfiguration 'ovn-kubernetes-ovn-kubernetes-resource-injector' created successfully"
+else
+    log [ERROR] "MutatingWebhookConfiguration 'ovn-kubernetes-ovn-kubernetes-resource-injector' was not created"
+    exit 1
+fi
 
 # Verify NAD creation
 if oc get net-attach-def -n "${OVNK_NAMESPACE}" dpf-ovn-kubernetes &>/dev/null; then

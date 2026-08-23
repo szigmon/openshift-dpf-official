@@ -1,0 +1,21 @@
+apiVersion: noderesources.dpu.nvidia.com/v1alpha1
+kind: NodeSRIOVDevicePluginConfig
+metadata:
+  name: <SRIOV_DP_CONFIG_NAME>
+  namespace: dpf-operator-system
+spec:
+  devicePluginResources:
+    - name: <SRIOV_DP_CONFIG_NAME>-mgmt
+      type: vf
+      ranges:
+        - pfIndex: 0
+          start: 1
+          end: 1
+    - name: <SRIOV_DP_CONFIG_NAME>
+      type: vf
+      options:
+        isRdma: true
+      ranges:
+        - pfIndex: 0
+          start: 2
+          end: <NUM_VFS_END>
